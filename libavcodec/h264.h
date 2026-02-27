@@ -107,6 +107,17 @@ enum {
     H264_MAX_MB_HEIGHT   = 1055,
     H264_MAX_WIDTH       = H264_MAX_MB_WIDTH  * 16,
     H264_MAX_HEIGHT      = H264_MAX_MB_HEIGHT * 16,
+
+    // H.7.4.2.1.4: num_views_minus1 is in [0, 1023], but we only
+    // support stereo MVC (2 views), matching HEVC_VPS_MAX_LAYERS.
+    H264_MVC_MAX_VIEWS = 2,
+    // H.10.2: num_anchor_refs_lX is in [0, 15].
+    H264_MAX_VIEW_REFS = 15,
+    // H.7.4.2.1.4: num_level_values_signalled_minus1 is in [0, 63].
+    H264_MAX_LEVEL_VALUES = 64,
+    // H.7.4.2.1.4: num_applicable_ops_minus1 is in [0, 1023], but
+    // we limit to a reasonable maximum for stereo MVC.
+    H264_MAX_APPLICABLE_OPS = 16,
 };
 
 
