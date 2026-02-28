@@ -130,9 +130,49 @@ static int mismatches_ref(const H264Context *h, const H264Picture *pic)
             h->cur_pic_ptr->f->format != f->format);
 }
 
+/**
+ * Initialize default reference picture lists for the current slice.
+ *
+ * H.264 spec 8.2.4.2: Initialization process for reference picture lists.
+ * MVC spec H.8.4: Modified initialization for multiview.
+ *
+ * For MVC, the DPB (short_ref[] and long_ref[]) contains pictures from ALL
+ * views. Each view's reference list must only contain pictures from its own
+ * view (temporal references) plus inter-view references. We filter the
+ * shared DPB into per-view arrays before building the default lists.
+ *
+ * For non-MVC streams, all view_ids are 0 (H264Picture is zero-initialized),
+ * so the filtering is a no-op and the arrays are identical copies.
+ */
 static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
 {
     int len;
+
+    /*
+     * MVC per-view DPB filtering (H.264 Annex H, H.8.4).
+     *
+     * The shared DPB may contain e.g.:
+     *   short_ref[0]: view_id=0, fn=5  (base view)
+     *   short_ref[1]: view_id=1, fn=5  (dependent view)
+     *   short_ref[2]: view_id=0, fn=4  (base view)
+     *   short_ref[3]: view_id=1, fn=4  (dependent view)
+     *
+     * If cur_view_id=1, view_short_ref[] will contain only [1] and [3].
+     * The base view pictures are excluded from temporal reference lists
+     * but may be added back as inter-view references (see below).
+     */
+    H264Picture *view_short_ref[32];
+    int view_short_count = 0;
+    H264Picture *view_long_ref[32] = { NULL };
+
+    for (int i = 0; i < h->short_ref_count; i++) {
+        if (h->short_ref[i]->view_id == h->cur_view_id)
+            view_short_ref[view_short_count++] = h->short_ref[i];
+    }
+    for (int i = 0; i < 16; i++) {
+        if (h->long_ref[i] && h->long_ref[i]->view_id == h->cur_view_id)
+            view_long_ref[i] = h->long_ref[i];
+    }
 
     if (sl->slice_type_nos == AV_PICTURE_TYPE_B) {
         H264Picture *sorted[32];
@@ -145,15 +185,15 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
             cur_poc = h->cur_pic_ptr->poc;
 
         for (int list = 0; list < 2; list++) {
-            len  = add_sorted(sorted,       h->short_ref, h->short_ref_count, cur_poc, 1 ^ list);
-            len += add_sorted(sorted + len, h->short_ref, h->short_ref_count, cur_poc, 0 ^ list);
+            len  = add_sorted(sorted,       view_short_ref, view_short_count, cur_poc, 1 ^ list);
+            len += add_sorted(sorted + len, view_short_ref, view_short_count, cur_poc, 0 ^ list);
             av_assert0(len <= 32);
 
             len  = build_def_list(sl->ref_list[list], FF_ARRAY_ELEMS(sl->ref_list[0]),
                                   sorted, len, 0, h->picture_structure);
             len += build_def_list(sl->ref_list[list] + len,
                                   FF_ARRAY_ELEMS(sl->ref_list[0]) - len,
-                                  h->long_ref, 16, 1, h->picture_structure);
+                                  view_long_ref, 16, 1, h->picture_structure);
             av_assert0(len <= 32);
 
             if (len < sl->ref_count[list])
@@ -172,14 +212,73 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
         }
     } else {
         len  = build_def_list(sl->ref_list[0], FF_ARRAY_ELEMS(sl->ref_list[0]),
-                              h->short_ref, h->short_ref_count, 0, h->picture_structure);
+                              view_short_ref, view_short_count, 0, h->picture_structure);
         len += build_def_list(sl->ref_list[0] + len,
                               FF_ARRAY_ELEMS(sl->ref_list[0]) - len,
-                              h-> long_ref, 16, 1, h->picture_structure);
+                              view_long_ref, 16, 1, h->picture_structure);
         av_assert0(len <= 32);
 
         if (len < sl->ref_count[0])
             memset(&sl->ref_list[0][len], 0, sizeof(H264Ref) * (sl->ref_count[0] - len));
+    }
+
+    /*
+     * MVC inter-view reference picture (H.264 Annex H, H.8.4).
+     *
+     * For a dependent view slice, we need to add the base view's picture
+     * from the same access unit as an additional reference. This is the
+     * "inter-view prediction" mechanism that allows a dependent view to
+     * reference the already-decoded base view instead of encoding
+     * everything independently.
+     *
+     * Inter-view refs are appended AFTER all temporal refs in the default
+     * reference list (spec H.8.4). The slice's ref_pic_list_modification
+     * (idc=4) can then move it to any position.
+     *
+     * Lookup key: frame_num (NOT POC).
+     * Both views in the same access unit share the same frame_num
+     * (it comes from the slice header, which is the same for both views
+     * in the same AU). However, POC differs between views because the
+     * shared H264POCContext produces different values for each view's
+     * poc_lsb. So frame_num is the reliable identifier for "same AU".
+     *
+     * If the base view picture is not in short_ref[] yet (can happen due
+     * to MPEG-TS PES packet ordering -- dependent view PES arrives before
+     * base view PES), the inter-view ref is simply not added. This causes
+     * a "reference picture missing" error for that slice, but doesn't
+     * crash. It self-corrects once the base view picture is decoded and
+     * added to short_ref[].
+     */
+    if (h->cur_view_id) {
+        H264Picture *iv_ref = NULL;
+        int cur_frame_num = h->cur_pic_ptr->frame_num;
+
+        /* Search the UNFILTERED short_ref[] for the base view (view_id=0)
+         * picture with matching frame_num. We search the unfiltered array
+         * because the base view was excluded from view_short_ref[]. */
+        for (int i = 0; i < h->short_ref_count; i++) {
+            if (h->short_ref[i]->view_id == 0 &&
+                h->short_ref[i]->frame_num == cur_frame_num) {
+                iv_ref = h->short_ref[i];
+                break;
+            }
+        }
+        if (iv_ref && !mismatches_ref(h, iv_ref)) {
+            /* Set pic_id to frame_num for consistency with the ref list
+             * modification process (idc=4 uses pic_id). */
+            iv_ref->pic_id = iv_ref->frame_num;
+            /* Append to all active reference lists (list0, and list1
+             * for B-slices). Find the first empty slot. */
+            for (int list = 0; list < 1 + (sl->slice_type_nos == AV_PICTURE_TYPE_B); list++) {
+                int pos;
+                for (pos = 0; pos < sl->ref_count[list]; pos++) {
+                    if (!sl->ref_list[list][pos].parent)
+                        break;
+                }
+                if (pos < FF_ARRAY_ELEMS(sl->ref_list[0]))
+                    ref_from_h264pic(&sl->ref_list[list][pos], iv_ref);
+            }
+        }
     }
 #ifdef TRACE
     for (int i = 0; i < sl->ref_count[0]; i++) {
@@ -328,11 +427,15 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
 
                 frame_num = pic_num_extract(h, pred, &pic_structure);
 
+                /* MVC: filter by view_id so a frame_num match doesn't
+                 * hit the other view's picture (both views share the
+                 * same frame_num within the same access unit). */
                 for (i = h->short_ref_count - 1; i >= 0; i--) {
                     ref = h->short_ref[i];
                     assert(ref->reference);
                     assert(!ref->long_ref);
                     if (ref->frame_num == frame_num &&
+                        ref->view_id == h->cur_view_id &&
                         (ref->reference & pic_structure))
                         break;
                 }
@@ -353,7 +456,9 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                 }
                 ref = h->long_ref[long_idx];
                 assert(!(ref && !ref->reference));
-                if (ref && (ref->reference & pic_structure)) {
+                /* MVC: same view_id filter as for short-term refs. */
+                if (ref && (ref->reference & pic_structure) &&
+                    ref->view_id == h->cur_view_id) {
                     assert(ref->long_ref);
                     i = 0;
                 } else {
@@ -361,6 +466,45 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                 }
                 break;
             }
+            case 4: {
+                /*
+                 * MVC inter-view reference picture list modification.
+                 * (H.264 Annex H, modification_of_pic_nums_idc == 4)
+                 *
+                 * The slice header contains abs_diff_view_idx_minus1 (parsed
+                 * as 'val' by the parser). For stereo MVC (2 views), this is
+                 * always 0, meaning "the first other view" = the base view.
+                 *
+                 * We find the inter-view reference by searching for a picture
+                 * with a DIFFERENT view_id but the SAME frame_num (= same
+                 * access unit). This picture is then placed at position
+                 * 'index' in the reference list, shifting others down.
+                 *
+                 * This allows the encoder to control exactly where the
+                 * inter-view reference appears in the ref list, enabling
+                 * weighted prediction or specific reference ordering.
+                 */
+                int cur_frame_num = h->cur_pic_ptr->frame_num;
+                pic_structure = h->picture_structure;
+                for (i = h->short_ref_count - 1; i >= 0; i--) {
+                    ref = h->short_ref[i];
+                    if (ref->view_id != h->cur_view_id &&
+                        ref->frame_num == cur_frame_num &&
+                        (ref->reference & pic_structure))
+                        break;
+                }
+                if (i >= 0)
+                    pic_id = ref->pic_id;
+                break;
+            }
+            case 5:
+                /*
+                 * MVC inter-view long-term reference modification.
+                 * (modification_of_pic_nums_idc == 5)
+                 * Not commonly used in stereo MVC. Treat as no-op.
+                 */
+                i = -1;
+                break;
             default:
                 av_assert0(0);
             }
@@ -448,7 +592,10 @@ int ff_h264_decode_ref_pic_list_reordering(H264SliceContext *sl, void *logctx)
             if (index >= sl->ref_count[list]) {
                 av_log(logctx, AV_LOG_ERROR, "reference count overflow\n");
                 return AVERROR_INVALIDDATA;
-            } else if (op > 2) {
+            } else if (op > 5) {
+                /* Standard H.264 defines idc 0-3. MVC (Annex H) adds
+                 * idc 4 (inter-view short-term ref) and 5 (inter-view
+                 * long-term ref). Values > 5 are invalid. */
                 av_log(logctx, AV_LOG_ERROR,
                        "illegal modification_of_pic_nums_idc %u\n",
                        op);
@@ -587,16 +734,47 @@ void ff_h264_remove_all_refs(H264Context *h)
     memset(h->default_ref, 0, sizeof(h->default_ref));
 }
 
+/**
+ * Generate sliding window memory management control operations.
+ *
+ * H.264 spec 8.2.5.3: Sliding window decoded reference picture marking.
+ * When no explicit MMCO is signaled, the oldest short-term ref is removed
+ * when the DPB is full (short + long >= max_num_ref_frames).
+ *
+ * MVC modification: Each view has its own "virtual DPB partition". The
+ * fullness check and removal operate on same-view references only. This
+ * prevents one view's references from evicting the other view's references.
+ *
+ * The oldest same-view index is tracked as we scan. Since short_ref[] is
+ * ordered newest-first (index 0 = newest), the highest matching index
+ * is the oldest same-view picture.
+ */
 static void generate_sliding_window_mmcos(H264Context *h)
 {
     MMCO *mmco = h->mmco;
     int nb_mmco = 0;
+    int view_short_count = 0;
+    int view_long_count = 0;
+    int oldest_view_idx = -1;
 
-    if (h->short_ref_count &&
-        h->long_ref_count + h->short_ref_count >= h->ps.sps->ref_frame_count &&
+    /* Count only same-view references for the sliding window check.
+     * For non-MVC streams (all view_ids == 0), this counts everything. */
+    for (int i = 0; i < h->short_ref_count; i++) {
+        if (h->short_ref[i]->view_id == h->cur_view_id) {
+            view_short_count++;
+            oldest_view_idx = i;  /* last match = highest index = oldest */
+        }
+    }
+    for (int i = 0; i < 16; i++) {
+        if (h->long_ref[i] && h->long_ref[i]->view_id == h->cur_view_id)
+            view_long_count++;
+    }
+
+    if (view_short_count &&
+        view_long_count + view_short_count >= h->ps.sps->ref_frame_count &&
         !(FIELD_PICTURE(h) && !h->first_field && h->cur_pic_ptr->reference)) {
         mmco[0].opcode        = MMCO_SHORT2UNUSED;
-        mmco[0].short_pic_num = h->short_ref[h->short_ref_count - 1]->frame_num;
+        mmco[0].short_pic_num = h->short_ref[oldest_view_idx]->frame_num;
         nb_mmco               = 1;
         if (FIELD_PICTURE(h)) {
             mmco[0].short_pic_num *= 2;
@@ -752,7 +930,31 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
                                            "(first field is long term)\n");
             err = AVERROR_INVALIDDATA;
         } else {
-            H264Picture *pic = remove_short(h, h->cur_pic_ptr->frame_num, 0);
+            /*
+             * Insert current picture into short_ref[].
+             *
+             * MVC complication: In the shared DPB, both views in the same
+             * access unit have the same frame_num. The standard code does
+             * remove_short(frame_num) which would remove ANY picture with
+             * that frame_num -- potentially the other view's picture.
+             *
+             * Fix: Only remove a picture if BOTH frame_num AND view_id
+             * match. This allows two pictures with the same frame_num
+             * (one per view) to coexist in short_ref[].
+             *
+             * For non-MVC streams this is equivalent to the original logic
+             * since all view_ids are 0.
+             */
+            H264Picture *pic = NULL;
+            for (int j = 0; j < h->short_ref_count; j++) {
+                if (h->short_ref[j]->frame_num == h->cur_pic_ptr->frame_num &&
+                    h->short_ref[j]->view_id == h->cur_view_id) {
+                    pic = h->short_ref[j];
+                    unreference_pic(h, pic, 0);
+                    remove_short_at_index(h, j);
+                    break;
+                }
+            }
             if (pic) {
                 av_log(h->avctx, AV_LOG_ERROR, "illegal short term buffer state detected\n");
                 err = AVERROR_INVALIDDATA;
@@ -768,29 +970,59 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
         }
     }
 
-    if (h->long_ref_count + h->short_ref_count > FFMAX(h->ps.sps->ref_frame_count, 1)) {
-
-        /* We have too many reference frames, probably due to corrupted
-         * stream. Need to discard one frame. Prevents overrun of the
-         * short_ref and long_ref buffers.
+    {
+        /*
+         * DPB overflow check.
+         *
+         * MVC: Each view's per-view ref count must not exceed
+         * max_num_ref_frames (from SPS). We count only same-view
+         * references. Without this, one view's refs could push the
+         * total count over the limit, causing the other view's refs
+         * to be incorrectly removed.
+         *
+         * For non-MVC, view_short == short_ref_count and
+         * view_long == long_ref_count (all view_ids are 0).
          */
-        av_log(h->avctx, AV_LOG_ERROR,
-               "number of reference frames (%d+%d) exceeds max (%d; probably "
-               "corrupt input), discarding one\n",
-               h->long_ref_count, h->short_ref_count, h->ps.sps->ref_frame_count);
-        err = AVERROR_INVALIDDATA;
+        int view_short = 0, view_long = 0;
+        for (int i = 0; i < h->short_ref_count; i++)
+            if (h->short_ref[i]->view_id == h->cur_view_id)
+                view_short++;
+        for (int i = 0; i < 16; i++)
+            if (h->long_ref[i] && h->long_ref[i]->view_id == h->cur_view_id)
+                view_long++;
 
-        if (h->long_ref_count && !h->short_ref_count) {
-            int i;
-            for (i = 0; i < 16; ++i)
-                if (h->long_ref[i])
-                    break;
+        if (view_long + view_short > FFMAX(h->ps.sps->ref_frame_count, 1)) {
 
-            assert(i < 16);
-            remove_long(h, i, 0);
-        } else {
-            H264Picture *pic = h->short_ref[h->short_ref_count - 1];
-            remove_short(h, pic->frame_num, 0);
+            /* We have too many reference frames, probably due to corrupted
+             * stream. Need to discard one frame. Prevents overrun of the
+             * short_ref and long_ref buffers.
+             */
+            av_log(h->avctx, AV_LOG_ERROR,
+                   "number of reference frames (%d+%d) exceeds max (%d; probably "
+                   "corrupt input), discarding one\n",
+                   view_long, view_short, h->ps.sps->ref_frame_count);
+            err = AVERROR_INVALIDDATA;
+
+            if (view_long && !view_short) {
+                int i;
+                /* Find first same-view long-term ref to remove. */
+                for (i = 0; i < 16; ++i)
+                    if (h->long_ref[i] &&
+                        h->long_ref[i]->view_id == h->cur_view_id)
+                        break;
+
+                assert(i < 16);
+                remove_long(h, i, 0);
+            } else {
+                /* Find oldest same-view short-term ref (highest index
+                 * in short_ref[], since newest is at index 0). */
+                int oldest = -1;
+                for (int i = 0; i < h->short_ref_count; i++)
+                    if (h->short_ref[i]->view_id == h->cur_view_id)
+                        oldest = i;
+                if (oldest >= 0)
+                    remove_short(h, h->short_ref[oldest]->frame_num, 0);
+            }
         }
     }
 

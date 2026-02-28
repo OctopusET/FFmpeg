@@ -637,7 +637,6 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
         err = 0;
         switch (nal->type) {
         case H264_NAL_IDR_SLICE:
-            h->cur_view_id = 0;
             if ((nal->data[1] & 0xFC) == 0x98) {
                 av_log(h->avctx, AV_LOG_ERROR, "Invalid inter IDR frame\n");
                 h->next_outputed_poc = INT_MIN;
@@ -650,6 +649,18 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             idr_cleared = 1;
             h->has_recovery_point = 1;
         case H264_NAL_SLICE:
+            /*
+             * Reset cur_view_id to 0 for base view slices.
+             *
+             * This is placed here (in SLICE, not IDR_SLICE) because
+             * IDR_SLICE falls through to SLICE. Without this, after
+             * processing a dependent view EXTEN_SLICE (which sets
+             * cur_view_id to a non-zero value), the next base view
+             * P-slice would inherit the wrong view_id.
+             *
+             * For non-MVC streams, this is harmless (already 0).
+             */
+            h->cur_view_id = 0;
             h->has_slice = 1;
 
             if ((err = ff_h264_queue_decode_slice(h, nal))) {
@@ -730,30 +741,93 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                 goto end;
             break;
         case H264_NAL_SUB_SPS: {
+            /*
+             * MVC Subset SPS (NAL type 15, H.264 Annex H, H.7.3.2.1.4).
+             *
+             * Contains a regular SPS followed by MVC extension fields
+             * (num_views, view dependencies, applicable operation points).
+             * We parse it as a regular SPS to get resolution/profile info.
+             * The MVC-specific fields are currently ignored -- view
+             * detection happens at runtime from EXTEN_SLICE NAL headers.
+             *
+             * The Subset SPS arrives on the dependent view's PID in
+             * MPEG-TS. After stream merging, it appears on the same
+             * AVStream as the base SPS.
+             */
             GetBitContext tmp_gb = nal->gb;
             ff_h264_decode_seq_parameter_set(&tmp_gb, avctx, &h->ps, 0);
             break;
         }
         case H264_NAL_PREFIX:
+            /*
+             * MVC Prefix NAL (NAL type 14).
+             *
+             * Precedes base view slices in MVC bitstreams. Contains the
+             * 3-byte MVC extension header (svc_extension_flag, non_idr_flag,
+             * priority_id, view_id, temporal_id, anchor_pic_flag,
+             * inter_view_flag, reserved_one_bit).
+             *
+             * The prefix NAL doesn't carry slice data itself -- it's
+             * metadata about the following base view slice. We could
+             * extract temporal_id and priority_id for sub-bitstream
+             * extraction, but for basic MVC decoding this is a no-op.
+             */
             break;
         case H264_NAL_EXTEN_SLICE: {
+            /*
+             * MVC Extension Slice (NAL type 20, H.264 Annex G/H).
+             *
+             * This is the dependent view's coded slice. The NAL header
+             * is 4 bytes (1 standard + 3 extension) instead of 1 byte.
+             * After the extension header, the bitstream is a standard
+             * H.264 slice header + slice data.
+             *
+             * Extension header layout (3 bytes = 24 bits):
+             *   svc_extension_flag  (1)  -- 0=MVC, 1=SVC
+             *   non_idr_flag        (1)  -- 0=IDR, 1=non-IDR
+             *   priority_id         (6)  -- sub-bitstream priority
+             *   view_id             (10) -- identifies the view
+             *   temporal_id         (3)  -- temporal scalability layer
+             *   anchor_pic_flag     (1)  -- 1 if anchor (similar to IDR)
+             *   inter_view_flag     (1)  -- 1 if used for inter-view pred
+             *   reserved_one_bit    (1)  -- must be 1
+             *
+             * Strategy: Parse the extension header, extract view_id, then
+             * rewrite nal->type to IDR_SLICE or SLICE. This lets the
+             * standard slice header parsing (ff_h264_queue_decode_slice)
+             * work unchanged -- it doesn't need to know about MVC.
+             */
             int non_idr_flag;
 
-            if (get_bits1(&nal->gb)) // svc_extension_flag
-                break; // SVC not supported
+            if (get_bits1(&nal->gb)) // svc_extension_flag == 1 means SVC
+                break; // SVC (Scalable Video Coding) not supported
             non_idr_flag = get_bits1(&nal->gb);
             skip_bits(&nal->gb, 6);            // priority_id
             h->cur_view_id = get_bits(&nal->gb, 10);
             skip_bits(&nal->gb, 6);            // temporal_id(3), anchor(1), inter_view(1), reserved(1)
 
-            // Rewrite NAL type so slice header parsing works normally
+            /*
+             * Rewrite NAL type so ff_h264_queue_decode_slice() processes
+             * this as a regular IDR or non-IDR slice. The slice header
+             * that follows the extension header is standard H.264.
+             */
             nal->type = non_idr_flag ? H264_NAL_SLICE : H264_NAL_IDR_SLICE;
             h->nal_unit_type = nal->type;
 
             if (!non_idr_flag) {
-                if (!idr_cleared)
-                    idr(h);
-                idr_cleared = 1;
+                /*
+                 * Dependent view IDR: Do NOT call idr() here.
+                 *
+                 * idr() removes ALL references from the DPB. The base
+                 * view's IDR (processed earlier in this AU) already
+                 * cleared the DPB and started fresh. If we call idr()
+                 * again for the dependent view, we'd remove the base
+                 * view's just-decoded IDR frame -- which the dependent
+                 * view needs as an inter-view reference.
+                 *
+                 * We only set has_recovery_point so the dependent IDR
+                 * is treated as a recovery point for error recovery.
+                 */
                 h->has_recovery_point = 1;
             }
 

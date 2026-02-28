@@ -2563,9 +2563,22 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
 
         stream_identifier = parse_stream_identifier_desc(p, p_end) + 1;
 
-        /* MVC dependent view: create PES for packet assembly but share
-         * the base H.264 stream's AVStream instead of creating a new one.
-         * Linking to the base stream is done after the main loop. */
+        /*
+         * MVC dependent view stream merging (H.264 Annex H, MPEG-TS).
+         *
+         * MVC in MPEG-TS uses two PIDs in the same program:
+         *   - PID A: stream_type=0x1B (H.264 base view) -- standard AVC NALs
+         *   - PID B: stream_type=0x20 (MVC dependent)   -- NAL types 15, 20
+         *
+         * The decoder needs NALs from both PIDs to build reference lists.
+         * Strategy: create a PES filter for the dependent view PID (for
+         * TS packet assembly), but do NOT create a separate AVStream.
+         * After this loop, we link the PES to the base H.264 stream so
+         * both PIDs deliver packets on the same AVStream.
+         *
+         * This means ffprobe shows one video stream (not two), and the
+         * decoder sees interleaved base+dependent NALs naturally.
+         */
         if (stream_type == STREAM_TYPE_VIDEO_MVC) {
             if (ts->pids[pid] && ts->pids[pid]->type == MPEGTS_PES) {
                 pes = ts->pids[pid]->u.pes_filter.opaque;
@@ -2578,6 +2591,8 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
             }
             pes->stream_type = stream_type;
             add_pid_to_program(prg, pid);
+            /* Skip the descriptor loop for MVC -- we don't need codec
+             * info since the base stream already has it. */
             desc_list_len = get16(&p, p_end);
             if (desc_list_len < 0)
                 goto out;
@@ -2586,7 +2601,7 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
             if (desc_list_end > p_end)
                 goto out;
             p = desc_list_end;
-            continue;
+            continue;  /* Don't create AVStream -- will be linked below */
         }
 
         /* now create stream */
@@ -2684,9 +2699,23 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
         p = desc_list_end;
     }
 
-    /* Link MVC dependent view PES to the base H.264 stream */
+    /*
+     * Link MVC dependent view PES to the base H.264 stream.
+     *
+     * Two-pass approach: first find the base H.264 PES (stream_type 0x1B),
+     * then link all MVC PES (stream_type 0x20) to share the base stream's
+     * AVStream pointer.
+     *
+     * merged_st = 1 tells mpegts_close_filter() not to free the PES
+     * context's stream pointer (since it's shared, not owned).
+     *
+     * After this, packets from the dependent view PID are delivered
+     * with st->index pointing to the base H.264 stream. The decoder
+     * sees them as part of the same stream.
+     */
     if (prg) {
         PESContext *base_pes = NULL;
+        /* Pass 1: Find the base H.264 stream in this program */
         for (int j = 0; j < prg->nb_pids; j++) {
             int p_pid = prg->pids[j];
             if (p_pid < NB_PID_MAX && ts->pids[p_pid] &&
@@ -2698,6 +2727,7 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
                 }
             }
         }
+        /* Pass 2: Link all MVC PES to the base stream */
         if (base_pes) {
             for (int j = 0; j < prg->nb_pids; j++) {
                 int p_pid = prg->pids[j];

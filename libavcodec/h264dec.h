@@ -163,7 +163,22 @@ typedef struct H264Picture {
 
     int gray;
 
-    int view_id;            ///< MVC view ID (0 = base view)
+    /**
+     * MVC view identifier (H.264 Annex H).
+     *
+     * 0 = base view (standard AVC). >0 = dependent view (MVC extension).
+     * Extracted from the 3-byte NAL extension header of NAL type 20
+     * (EXTEN_SLICE). Set in ff_h264_queue_decode_slice() when the picture
+     * is allocated (h264_slice.c).
+     *
+     * Used by reference management (h264_refs.c) to filter the shared DPB
+     * into per-view reference lists. Both views in the same access unit
+     * share the same frame_num but have different view_ids.
+     *
+     * For non-MVC streams, this is always 0 (zero-initialized by memset
+     * in ff_h264_unref_picture).
+     */
+    int view_id;
 } H264Picture;
 
 typedef struct H264Ref {
@@ -580,7 +595,19 @@ typedef struct H264Context {
     int noref_gray;
     int skip_gray;
 
-    int cur_view_id;                    ///< view_id of the NAL currently being decoded
+    /**
+     * MVC: view_id of the NAL currently being decoded.
+     *
+     * Set in decode_nal_units() (h264dec.c):
+     * - To 0 for NAL types SLICE/IDR_SLICE (base view).
+     * - To the extension header's view_id for NAL type EXTEN_SLICE.
+     *
+     * Propagated to H264Picture.view_id when a new picture is allocated.
+     * Used throughout h264_refs.c to filter references by view.
+     *
+     * For non-MVC streams, always 0.
+     */
+    int cur_view_id;
 } H264Context;
 
 extern const uint16_t ff_h264_mb_sizes[4];

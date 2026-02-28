@@ -531,6 +531,9 @@ static int h264_frame_start(H264Context *h)
         return ret;
 
     h->cur_pic_ptr = pic;
+    /* MVC: Tag the newly allocated picture with the current view_id.
+     * This is how we track which view each picture in the DPB belongs to.
+     * For non-MVC streams, cur_view_id is always 0. */
     pic->view_id = h->cur_view_id;
     ff_h264_unref_picture(&h->cur_pic);
     if (CONFIG_ERROR_RESILIENCE) {
