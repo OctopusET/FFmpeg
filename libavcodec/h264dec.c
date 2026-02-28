@@ -39,6 +39,7 @@
 #include "libavutil/video_enc_params.h"
 
 #include "codec_internal.h"
+#include "decode.h"
 #include "internal.h"
 #include "error_resilience.h"
 #include "avcodec.h"
@@ -366,6 +367,7 @@ static av_cold int h264_decode_end(AVCodecContext *avctx)
     h->cur_pic_ptr = NULL;
 
     av_refstruct_pool_uninit(&h->decode_error_flags_pool);
+    av_container_fifo_free(&h->output_fifo);
 
     av_freep(&h->slice_ctx);
     h->nb_slice_ctx = 0;
@@ -387,6 +389,10 @@ static av_cold int h264_decode_init(AVCodecContext *avctx)
 {
     H264Context *h = avctx->priv_data;
     int ret;
+
+    h->output_fifo = av_container_fifo_alloc_avframe(0);
+    if (!h->output_fifo)
+        return AVERROR(ENOMEM);
 
     ret = h264_init_context(avctx, h);
     if (ret < 0)
@@ -480,6 +486,8 @@ static av_cold void h264_decode_flush(AVCodecContext *avctx)
     H264Context *h = avctx->priv_data;
     int i;
 
+    av_container_fifo_drain(h->output_fifo,
+                            av_container_fifo_can_read(h->output_fifo));
     memset(h->delayed_pic, 0, sizeof(h->delayed_pic));
 
     ff_h264_flush_change(h);
@@ -1053,63 +1061,87 @@ static int is_avcc_extradata(const uint8_t *buf, int buf_size)
     return 1;
 }
 
-static int finalize_frame(H264Context *h, AVFrame *dst, H264Picture *out, int *got_frame)
+/**
+ * Finalize a decoded picture and push it into the output FIFO.
+ *
+ * Checks recovery/corruption flags, duplicates missing fields,
+ * applies output_frame() post-processing (film grain, side data),
+ * and writes the result into h->output_fifo.
+ *
+ * For non-MVC streams the FIFO will contain at most one frame per
+ * decode call. For MVC, both the base and dependent view pictures
+ * are pushed, so the caller can pop them one at a time.
+ *
+ * @return 0 on success or if the frame was skipped, negative on error
+ */
+static int finalize_frame(H264Context *h, H264Picture *out)
 {
+    AVFrame *dst;
     int ret;
 
-    if (((h->avctx->flags & AV_CODEC_FLAG_OUTPUT_CORRUPT) ||
-         (h->avctx->flags2 & AV_CODEC_FLAG2_SHOW_ALL) ||
-         out->recovered)) {
+    if (!((h->avctx->flags & AV_CODEC_FLAG_OUTPUT_CORRUPT) ||
+          (h->avctx->flags2 & AV_CODEC_FLAG2_SHOW_ALL) ||
+          out->recovered))
+        return 0;
 
-        if (h->skip_gray > 0 &&
-            h->non_gray && out->gray &&
-            !(h->avctx->flags2 & AV_CODEC_FLAG2_SHOW_ALL)
-        )
-            return 0;
+    if (h->skip_gray > 0 &&
+        h->non_gray && out->gray &&
+        !(h->avctx->flags2 & AV_CODEC_FLAG2_SHOW_ALL))
+        return 0;
 
-        if (!h->avctx->hwaccel &&
-            (out->field_poc[0] == INT_MAX ||
-             out->field_poc[1] == INT_MAX)
-           ) {
-            int p;
-            AVFrame *f = out->f;
-            int field = out->field_poc[0] == INT_MAX;
-            uint8_t *dst_data[4];
-            int linesizes[4];
-            const uint8_t *src_data[4];
+    if (!h->avctx->hwaccel &&
+        (out->field_poc[0] == INT_MAX ||
+         out->field_poc[1] == INT_MAX)) {
+        int p;
+        AVFrame *f = out->f;
+        int field = out->field_poc[0] == INT_MAX;
+        uint8_t *dst_data[4];
+        int linesizes[4];
+        const uint8_t *src_data[4];
 
-            av_log(h->avctx, AV_LOG_DEBUG, "Duplicating field %d to fill missing\n", field);
+        av_log(h->avctx, AV_LOG_DEBUG, "Duplicating field %d to fill missing\n", field);
 
-            for (p = 0; p<4; p++) {
-                dst_data[p] = f->data[p] + (field^1)*f->linesize[p];
-                src_data[p] = f->data[p] +  field   *f->linesize[p];
-                linesizes[p] = 2*f->linesize[p];
-            }
-
-            av_image_copy(dst_data, linesizes, src_data, linesizes,
-                          f->format, f->width, f->height>>1);
+        for (p = 0; p < 4; p++) {
+            dst_data[p] = f->data[p] + (field ^ 1) * f->linesize[p];
+            src_data[p] = f->data[p] +  field      * f->linesize[p];
+            linesizes[p] = 2 * f->linesize[p];
         }
 
-        ret = output_frame(h, dst, out);
-        if (ret < 0)
-            return ret;
-
-        *got_frame = 1;
-
-        if (CONFIG_MPEGVIDEODEC) {
-            ff_print_debug_info2(h->avctx, dst,
-                                 out->mb_type,
-                                 out->qscale_table,
-                                 out->motion_val,
-                                 out->mb_width, out->mb_height, out->mb_stride, 1);
-        }
+        av_image_copy(dst_data, linesizes, src_data, linesizes,
+                      f->format, f->width, f->height >> 1);
     }
 
-    return 0;
+    dst = av_frame_alloc();
+    if (!dst)
+        return AVERROR(ENOMEM);
+
+    ret = output_frame(h, dst, out);
+    if (ret < 0)
+        goto fail;
+
+    if (CONFIG_MPEGVIDEODEC) {
+        ff_print_debug_info2(h->avctx, dst,
+                             out->mb_type,
+                             out->qscale_table,
+                             out->motion_val,
+                             out->mb_width, out->mb_height, out->mb_stride, 1);
+    }
+
+    ret = av_container_fifo_write(h->output_fifo, dst, 0);
+
+fail:
+    av_frame_free(&dst);
+    return ret;
 }
 
-static int send_next_delayed_frame(H264Context *h, AVFrame *dst_frame,
-                                   int *got_frame, int buf_index)
+/**
+ * Drain all remaining delayed pictures into the output FIFO.
+ *
+ * Called on EOF (zero-size packet) or NAL_END_SEQUENCE to flush the
+ * reorder buffer. Pictures are output in POC order, lowest first.
+ * For MVC, pictures from both views are interleaved by POC.
+ */
+static int h264_flush_delayed_to_fifo(H264Context *h)
 {
     int ret, i, out_idx;
     H264Picture *out;
@@ -1138,23 +1170,31 @@ static int send_next_delayed_frame(H264Context *h, AVFrame *dst_frame,
             out->recovered |= h->frame_recovered & FRAME_RECOVERED_SEI;
 
             out->reference &= ~DELAYED_PIC_REF;
-            ret = finalize_frame(h, dst_frame, out, got_frame);
+            ret = finalize_frame(h, out);
             if (ret < 0)
                 return ret;
-            if (*got_frame)
-                break;
         }
     }
 
-    return buf_index;
+    return 0;
 }
 
-static int h264_decode_frame(AVCodecContext *avctx, AVFrame *pict,
-                             int *got_frame, AVPacket *avpkt)
+/**
+ * Decode one packet and push output frames into the FIFO.
+ *
+ * This is the core decode function, adapted from the old h264_decode_frame().
+ * Instead of returning a single frame directly, it pushes decoded frames
+ * into h->output_fifo. The caller (h264_receive_frame) pops them one at
+ * a time.
+ *
+ * @param avpkt the packet to decode (must be non-empty)
+ * @return 0 on success, negative on error
+ */
+static int h264_decode_packet(H264Context *h, AVPacket *avpkt)
 {
+    AVCodecContext *avctx = h->avctx;
     const uint8_t *buf = avpkt->data;
     int buf_size       = avpkt->size;
-    H264Context *h     = avctx->priv_data;
     int buf_index;
     int ret;
 
@@ -1163,10 +1203,6 @@ static int h264_decode_frame(AVCodecContext *avctx, AVFrame *pict,
     h->nb_slice_ctx_queued = 0;
 
     ff_h264_unref_picture(&h->last_pic_for_ec);
-
-    /* end of stream, output what is still in the buffers */
-    if (buf_size == 0)
-        return send_next_delayed_frame(h, pict, got_frame, 0);
 
     if (av_packet_get_side_data(avpkt, AV_PKT_DATA_NEW_EXTRADATA, NULL)) {
         size_t side_size;
@@ -1188,13 +1224,13 @@ static int h264_decode_frame(AVCodecContext *avctx, AVFrame *pict,
 
     if (!h->cur_pic_ptr && h->nal_unit_type == H264_NAL_END_SEQUENCE) {
         av_assert0(buf_index <= buf_size);
-        return send_next_delayed_frame(h, pict, got_frame, buf_index);
+        return h264_flush_delayed_to_fifo(h);
     }
 
     if (!(avctx->flags2 & AV_CODEC_FLAG2_CHUNKS) && (!h->cur_pic_ptr || !h->has_slice)) {
         if (avctx->skip_frame >= AVDISCARD_NONREF ||
             buf_size >= 4 && !memcmp("Q264", buf, 4))
-            return buf_size;
+            return 0;
         av_log(avctx, AV_LOG_ERROR, "no frame!\n");
         return AVERROR_INVALIDDATA;
     }
@@ -1204,19 +1240,62 @@ static int h264_decode_frame(AVCodecContext *avctx, AVFrame *pict,
         if ((ret = ff_h264_field_end(h, &h->slice_ctx[0], 0)) < 0)
             return ret;
 
-        /* Wait for second field. */
         if (h->next_output_pic) {
-            ret = finalize_frame(h, pict, h->next_output_pic, got_frame);
+            ret = finalize_frame(h, h->next_output_pic);
             if (ret < 0)
                 return ret;
         }
     }
 
-    av_assert0(pict->buf[0] || !*got_frame);
-
     ff_h264_unref_picture(&h->last_pic_for_ec);
 
-    return buf_size;
+    return 0;
+}
+
+/**
+ * receive_frame callback for the H.264 decoder.
+ *
+ * Uses an output FIFO to support multi-frame output from a single decode
+ * call, which is needed for MVC multiview (each access unit produces one
+ * frame per view). For non-MVC streams, the FIFO contains at most one
+ * frame per decode call, so behavior is equivalent to the old API.
+ *
+ * Flow:
+ *   1. If the FIFO has frames from a previous decode, return one.
+ *   2. Get the next packet via ff_decode_get_packet().
+ *   3. On EOF, flush remaining delayed pictures into the FIFO.
+ *   4. Decode the packet (pushes frames into the FIFO).
+ *   5. Return one frame from the FIFO, or EAGAIN/EOF.
+ */
+static int h264_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+{
+    H264Context *h = avctx->priv_data;
+    AVCodecInternal *avci = avctx->internal;
+    AVPacket *avpkt = avci->in_pkt;
+    int ret;
+
+    if (av_container_fifo_can_read(h->output_fifo))
+        goto do_output;
+
+    av_packet_unref(avpkt);
+    ret = ff_decode_get_packet(avctx, avpkt);
+    if (ret == AVERROR_EOF) {
+        ret = h264_flush_delayed_to_fifo(h);
+        if (ret < 0)
+            return ret;
+        goto do_output;
+    } else if (ret < 0)
+        return ret;
+
+    ret = h264_decode_packet(h, avpkt);
+    if (ret < 0)
+        return ret;
+
+do_output:
+    if (av_container_fifo_read(h->output_fifo, frame, 0) >= 0)
+        return 0;
+
+    return avci->draining ? AVERROR_EOF : AVERROR(EAGAIN);
 }
 
 #define OFFSET(x) offsetof(H264Context, x)
@@ -1247,7 +1326,7 @@ const FFCodec ff_h264_decoder = {
     .priv_data_size        = sizeof(H264Context),
     .init                  = h264_decode_init,
     .close                 = h264_decode_end,
-    FF_CODEC_DECODE_CB(h264_decode_frame),
+    FF_CODEC_RECEIVE_FRAME_CB(h264_receive_frame),
     .p.capabilities        = AV_CODEC_CAP_DR1 |
                              AV_CODEC_CAP_DELAY | AV_CODEC_CAP_SLICE_THREADS |
                              AV_CODEC_CAP_FRAME_THREADS,

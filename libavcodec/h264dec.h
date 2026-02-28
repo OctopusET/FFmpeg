@@ -28,6 +28,7 @@
 #ifndef AVCODEC_H264DEC_H
 #define AVCODEC_H264DEC_H
 
+#include "libavutil/container_fifo.h"
 #include "libavutil/mem_internal.h"
 
 #include "cabac.h"
@@ -621,6 +622,18 @@ typedef struct H264Context {
      * Set in decode_nal_units() before calling queue_decode_slice().
      */
     int idr_pic_flag;
+
+    /**
+     * Output FIFO for multi-frame output (MVC multiview).
+     *
+     * With MVC, a single access unit produces one frame per view
+     * (base + dependent). The receive_frame API returns one frame at
+     * a time, so decoded frames are pushed here and drained one by one.
+     *
+     * For non-MVC streams the FIFO contains exactly one frame per
+     * decode call, so behavior is equivalent to the old decode_frame API.
+     */
+    AVContainerFifo *output_fifo;
 } H264Context;
 
 extern const uint16_t ff_h264_mb_sizes[4];
