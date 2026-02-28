@@ -1064,12 +1064,13 @@ out:
 }
 
 int ff_h264_decode_ref_pic_marking(H264SliceContext *sl, GetBitContext *gb,
-                                   const H2645NAL *nal, void *logctx)
+                                   const H2645NAL *nal, int idr_pic_flag,
+                                   void *logctx)
 {
     MMCO *mmco = sl->mmco;
     int nb_mmco = 0;
 
-    if (nal->type == H264_NAL_IDR_SLICE) { // FIXME fields
+    if (idr_pic_flag) {
         skip_bits1(gb); // broken_link
         if (get_bits1(gb)) {
             mmco[0].opcode   = MMCO_LONG;

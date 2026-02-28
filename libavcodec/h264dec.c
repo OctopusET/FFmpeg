@@ -649,18 +649,8 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             idr_cleared = 1;
             h->has_recovery_point = 1;
         case H264_NAL_SLICE:
-            /*
-             * Reset cur_view_id to 0 for base view slices.
-             *
-             * This is placed here (in SLICE, not IDR_SLICE) because
-             * IDR_SLICE falls through to SLICE. Without this, after
-             * processing a dependent view EXTEN_SLICE (which sets
-             * cur_view_id to a non-zero value), the next base view
-             * P-slice would inherit the wrong view_id.
-             *
-             * For non-MVC streams, this is harmless (already 0).
-             */
             h->cur_view_id = 0;
+            h->idr_pic_flag = (nal->type == H264_NAL_IDR_SLICE);
             h->has_slice = 1;
 
             if ((err = ff_h264_queue_decode_slice(h, nal))) {
@@ -807,26 +797,31 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             skip_bits(&nal->gb, 6);            // temporal_id(3), anchor(1), inter_view(1), reserved(1)
 
             /*
-             * Rewrite NAL type so ff_h264_queue_decode_slice() processes
-             * this as a regular IDR or non-IDR slice. The slice header
-             * that follows the extension header is standard H.264.
+             * Rewrite NAL type to regular SLICE.
+             *
+             * MVC extension slices are always rewritten to NAL_SLICE
+             * (never IDR_SLICE), even when non_idr_flag == 0. Reason:
+             * MVC "IDR" slices in the dependent view use inter-view
+             * prediction (P-slice referencing the base view), so they
+             * are NOT all-intra. The slice header parse rejects
+             * non-I slices with nal_type == IDR_SLICE ("A non-intra
+             * slice in an IDR NAL unit").
+             *
+             * The non_idr_flag only means this is an MVC anchor picture
+             * (similar to a random access point), not a standard H.264
+             * IDR. The base view's IDR already handled the DPB reset.
              */
-            nal->type = non_idr_flag ? H264_NAL_SLICE : H264_NAL_IDR_SLICE;
+            nal->type = H264_NAL_SLICE;
             h->nal_unit_type = nal->type;
+
+            h->idr_pic_flag = !non_idr_flag;
 
             if (!non_idr_flag) {
                 /*
-                 * Dependent view IDR: Do NOT call idr() here.
-                 *
-                 * idr() removes ALL references from the DPB. The base
-                 * view's IDR (processed earlier in this AU) already
-                 * cleared the DPB and started fresh. If we call idr()
-                 * again for the dependent view, we'd remove the base
-                 * view's just-decoded IDR frame -- which the dependent
-                 * view needs as an inter-view reference.
-                 *
-                 * We only set has_recovery_point so the dependent IDR
-                 * is treated as a recovery point for error recovery.
+                 * MVC anchor picture (non_idr_flag == 0).
+                 * Mark as recovery point for error recovery.
+                 * Don't call idr() -- the base view's IDR already
+                 * cleared the DPB.
                  */
                 h->has_recovery_point = 1;
             }

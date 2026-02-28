@@ -608,6 +608,19 @@ typedef struct H264Context {
      * For non-MVC streams, always 0.
      */
     int cur_view_id;
+
+    /**
+     * IdrPicFlag for MVC (H.264 Annex H, H.7.4.1.1).
+     *
+     * For NAL type 20 (EXTEN_SLICE), IdrPicFlag = !non_idr_flag.
+     * When set, the slice header contains idr_pic_id and POC is
+     * reset, even though nal_unit_type != 5 and the slice may be
+     * a P-slice (inter-view predicted).
+     *
+     * For regular NAL types 1-5, this equals (nal_unit_type == 5).
+     * Set in decode_nal_units() before calling queue_decode_slice().
+     */
+    int idr_pic_flag;
 } H264Context;
 
 extern const uint16_t ff_h264_mb_sizes[4];
@@ -633,7 +646,8 @@ void ff_h264_remove_all_refs(H264Context *h);
 int ff_h264_execute_ref_pic_marking(H264Context *h);
 
 int ff_h264_decode_ref_pic_marking(H264SliceContext *sl, GetBitContext *gb,
-                                   const H2645NAL *nal, void *logctx);
+                                   const H2645NAL *nal, int idr_pic_flag,
+                                   void *logctx);
 
 void ff_h264_hl_decode_mb(const H264Context *h, H264SliceContext *sl);
 void ff_h264_decode_init_vlc(void);

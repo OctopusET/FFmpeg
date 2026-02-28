@@ -1427,7 +1427,7 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
     h->poc.delta_poc[0]     = sl->delta_poc[0];
     h->poc.delta_poc[1]     = sl->delta_poc[1];
 
-    if (nal->type == H264_NAL_IDR_SLICE)
+    if (h->idr_pic_flag)
         h->poc_offset = sl->idr_pic_id;
     else if (h->picture_intra_only)
         h->poc_offset = 0;
@@ -1643,7 +1643,13 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
     h->nb_mmco = sl->nb_mmco;
     h->explicit_ref_marking = sl->explicit_ref_marking;
 
-    h->picture_idr = nal->type == H264_NAL_IDR_SLICE;
+    /*
+     * picture_idr controls DPB clearing in execute_ref_pic_marking().
+     * For MVC dependent views, the base view IDR already cleared the DPB.
+     * Setting picture_idr for a dep view anchor would incorrectly remove
+     * the base view picture that the dep view needs for inter-view prediction.
+     */
+    h->picture_idr = h->idr_pic_flag && !h->cur_view_id;
 
     if (h->sei.recovery_point.recovery_frame_cnt >= 0) {
         const int sei_recovery_frame_cnt = h->sei.recovery_point.recovery_frame_cnt;
@@ -1660,9 +1666,9 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
         }
     }
 
-    h->cur_pic_ptr->f->flags |= AV_FRAME_FLAG_KEY * !!(nal->type == H264_NAL_IDR_SLICE);
+    h->cur_pic_ptr->f->flags |= AV_FRAME_FLAG_KEY * !!h->idr_pic_flag;
 
-    if (nal->type == H264_NAL_IDR_SLICE) {
+    if (h->idr_pic_flag) {
         h->cur_pic_ptr->recovered |= FRAME_RECOVERED_IDR;
         // If we have an IDR, all frames after it in decoded order are
         // "recovered".
@@ -1786,7 +1792,7 @@ static int h264_slice_header_parse(const H264Context *h, H264SliceContext *sl,
         sl->max_pic_num  = 1 << (sps->log2_max_frame_num + 1);
     }
 
-    if (nal->type == H264_NAL_IDR_SLICE) {
+    if (h->idr_pic_flag) {
         unsigned idr_pic_id = get_ue_golomb_long(&sl->gb);
         if (idr_pic_id < 65536) {
             sl->idr_pic_id = idr_pic_id;
@@ -1849,7 +1855,8 @@ static int h264_slice_header_parse(const H264Context *h, H264SliceContext *sl,
 
     sl->explicit_ref_marking = 0;
     if (nal->ref_idc) {
-        ret = ff_h264_decode_ref_pic_marking(sl, &sl->gb, nal, h->avctx);
+        ret = ff_h264_decode_ref_pic_marking(sl, &sl->gb, nal,
+                                              h->idr_pic_flag, h->avctx);
         if (ret < 0 && (h->avctx->err_recognition & AV_EF_EXPLODE))
             return AVERROR_INVALIDDATA;
     }
@@ -1920,7 +1927,7 @@ static int h264_slice_init(H264Context *h, H264SliceContext *sl,
 {
     int i, j, ret = 0;
 
-    if (h->picture_idr && nal->type != H264_NAL_IDR_SLICE) {
+    if (h->picture_idr && !h->idr_pic_flag) {
         av_log(h->avctx, AV_LOG_ERROR, "Invalid mix of IDR and non-IDR slices\n");
         return AVERROR_INVALIDDATA;
     }
@@ -1958,7 +1965,7 @@ static int h264_slice_init(H264Context *h, H264SliceContext *sl,
 
     if (h->avctx->skip_loop_filter >= AVDISCARD_ALL ||
         (h->avctx->skip_loop_filter >= AVDISCARD_NONKEY &&
-         h->nal_unit_type != H264_NAL_IDR_SLICE) ||
+         !h->idr_pic_flag) ||
         (h->avctx->skip_loop_filter >= AVDISCARD_NONINTRA &&
          sl->slice_type_nos != AV_PICTURE_TYPE_I) ||
         (h->avctx->skip_loop_filter >= AVDISCARD_BIDIR  &&
@@ -2048,7 +2055,7 @@ static int h264_slice_init(H264Context *h, H264SliceContext *sl,
                sl->mb_y * h->mb_width + sl->mb_x,
                av_get_picture_type_char(sl->slice_type),
                sl->slice_type_fixed ? " fix" : "",
-               nal->type == H264_NAL_IDR_SLICE ? " IDR" : "",
+               h->idr_pic_flag ? " IDR" : "",
                h->poc.frame_num,
                h->cur_pic_ptr->field_poc[0],
                h->cur_pic_ptr->field_poc[1],
@@ -2110,8 +2117,22 @@ int ff_h264_queue_decode_slice(H264Context *h, const H2645NAL *nal)
                 ret = ff_h264_field_end(h, h->slice_ctx, 1);
                 if (ret < 0)
                     return ret;
-            } else if (h->cur_pic_ptr && !FIELD_PICTURE(h) && !h->first_field && h->nal_unit_type  == H264_NAL_IDR_SLICE) {
-                av_log(h->avctx, AV_LOG_WARNING, "Broken frame packetizing\n");
+            } else if (h->cur_pic_ptr && !FIELD_PICTURE(h) && !h->first_field &&
+                       (h->idr_pic_flag ||
+                        h->cur_pic_ptr->view_id != h->cur_view_id)) {
+                /*
+                 * Two cases reach here:
+                 * 1) Broken frame packetizing: an IDR slice starts a new
+                 *    picture while a non-IDR was in progress.
+                 * 2) MVC view transition: the current picture belongs to a
+                 *    different view than the incoming NAL. This is normal
+                 *    for MVC -- each access unit has back-to-back pictures
+                 *    from different views (e.g., dep IDR followed by base P).
+                 *    Without this, field_end would never be called for the
+                 *    current picture, so it would never be added to short_ref.
+                 */
+                if (h->cur_pic_ptr->view_id == h->cur_view_id)
+                    av_log(h->avctx, AV_LOG_WARNING, "Broken frame packetizing\n");
                 ret = ff_h264_field_end(h, h->slice_ctx, 1);
                 ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX, 0);
                 ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX, 1);
@@ -2139,7 +2160,7 @@ int ff_h264_queue_decode_slice(H264Context *h, const H2645NAL *nal)
             (h->avctx->skip_frame >= AVDISCARD_NONREF && !h->nal_ref_idc) ||
             (h->avctx->skip_frame >= AVDISCARD_BIDIR  && sl->slice_type_nos == AV_PICTURE_TYPE_B) ||
             (h->avctx->skip_frame >= AVDISCARD_NONINTRA && sl->slice_type_nos != AV_PICTURE_TYPE_I) ||
-            (h->avctx->skip_frame >= AVDISCARD_NONKEY && h->nal_unit_type != H264_NAL_IDR_SLICE && h->sei.recovery_point.recovery_frame_cnt < 0) ||
+            (h->avctx->skip_frame >= AVDISCARD_NONKEY && !h->idr_pic_flag && h->sei.recovery_point.recovery_frame_cnt < 0) ||
             h->avctx->skip_frame >= AVDISCARD_ALL) {
             return 0;
         }
