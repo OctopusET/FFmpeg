@@ -903,18 +903,20 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
             for (int j = mmco[i].long_arg; j < 16; j++)
                 remove_long(h, j, 0);
             break;
-        case MMCO_RESET:
+        case MMCO_RESET: {
+            H264POCContext *const poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
             while (h->short_ref_count) {
                 remove_short(h, h->short_ref[0]->frame_num, 0);
             }
             for (int j = 0; j < 16; j++)
                 remove_long(h, j, 0);
-            h->poc.frame_num = h->cur_pic_ptr->frame_num = 0;
+            poc->frame_num = h->cur_pic_ptr->frame_num = 0;
             h->mmco_reset = 1;
             h->cur_pic_ptr->mmco_reset = 1;
             for (int j = 0; j < FF_ARRAY_ELEMS(h->last_pocs); j++)
                 h->last_pocs[j] = INT_MIN;
             break;
+        }
         default: av_assert0(0);
         }
     }

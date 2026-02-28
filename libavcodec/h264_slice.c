@@ -419,7 +419,8 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
     h->is_avc = h1->is_avc;
     h->nal_length_size = h1->nal_length_size;
 
-    memcpy(&h->poc,        &h1->poc,        sizeof(h->poc));
+    memcpy(&h->poc,          &h1->poc,          sizeof(h->poc));
+    memcpy(&h->dep_view_poc, &h1->dep_view_poc, sizeof(h->dep_view_poc));
 
     memcpy(h->short_ref,   h1->short_ref,   sizeof(h->short_ref));
     memcpy(h->long_ref,    h1->long_ref,    sizeof(h->long_ref));
@@ -457,13 +458,16 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
     if (!h->cur_pic_ptr)
         return 0;
 
-    if (!h->droppable) {
-        err = ff_h264_execute_ref_pic_marking(h);
-        h->poc.prev_poc_msb = h->poc.poc_msb;
-        h->poc.prev_poc_lsb = h->poc.poc_lsb;
+    {
+        H264POCContext *const poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
+        if (!h->droppable) {
+            err = ff_h264_execute_ref_pic_marking(h);
+            poc->prev_poc_msb = poc->poc_msb;
+            poc->prev_poc_lsb = poc->poc_lsb;
+        }
+        poc->prev_frame_num_offset = poc->frame_num_offset;
+        poc->prev_frame_num        = poc->frame_num;
     }
-    h->poc.prev_frame_num_offset = h->poc.frame_num_offset;
-    h->poc.prev_frame_num        = h->poc.frame_num;
 
     h->recovery_frame        = h1->recovery_frame;
     h->non_gray              = h1->non_gray;
@@ -1406,6 +1410,17 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
 {
     int i;
     const SPS *sps;
+    /*
+     * Per-view POC context pointer (MVC, H.264 Annex H).
+     *
+     * Each view maintains independent POC state because each view's
+     * slice headers carry their own poc_lsb / delta_poc parameters,
+     * and the prev_poc_msb/lsb tracking must not be cross-contaminated.
+     *
+     * For base view (cur_view_id == 0) this points to h->poc (unchanged).
+     * For the dependent view it points to h->dep_view_poc.
+     */
+    H264POCContext *const poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
 
     int last_pic_structure, last_pic_droppable, ret;
 
@@ -1425,11 +1440,11 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
     h->droppable         = (nal->ref_idc == 0);
     h->picture_structure = sl->picture_structure;
 
-    h->poc.frame_num        = sl->frame_num;
-    h->poc.poc_lsb          = sl->poc_lsb;
-    h->poc.delta_poc_bottom = sl->delta_poc_bottom;
-    h->poc.delta_poc[0]     = sl->delta_poc[0];
-    h->poc.delta_poc[1]     = sl->delta_poc[1];
+    poc->frame_num        = sl->frame_num;
+    poc->poc_lsb          = sl->poc_lsb;
+    poc->delta_poc_bottom = sl->delta_poc_bottom;
+    poc->delta_poc[0]     = sl->delta_poc[0];
+    poc->delta_poc[1]     = sl->delta_poc[1];
 
     if (h->idr_pic_flag)
         h->poc_offset = sl->idr_pic_id;
@@ -1438,19 +1453,19 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
 
     /* Shorten frame num gaps so we don't have to allocate reference
      * frames just to throw them away */
-    if (h->poc.frame_num != h->poc.prev_frame_num) {
-        int unwrap_prev_frame_num = h->poc.prev_frame_num;
+    if (poc->frame_num != poc->prev_frame_num) {
+        int unwrap_prev_frame_num = poc->prev_frame_num;
         int max_frame_num         = 1 << sps->log2_max_frame_num;
 
-        if (unwrap_prev_frame_num > h->poc.frame_num)
+        if (unwrap_prev_frame_num > poc->frame_num)
             unwrap_prev_frame_num -= max_frame_num;
 
-        if ((h->poc.frame_num - unwrap_prev_frame_num) > sps->ref_frame_count) {
-            unwrap_prev_frame_num = (h->poc.frame_num - sps->ref_frame_count) - 1;
+        if ((poc->frame_num - unwrap_prev_frame_num) > sps->ref_frame_count) {
+            unwrap_prev_frame_num = (poc->frame_num - sps->ref_frame_count) - 1;
             if (unwrap_prev_frame_num < 0)
                 unwrap_prev_frame_num += max_frame_num;
 
-            h->poc.prev_frame_num = unwrap_prev_frame_num;
+            poc->prev_frame_num = unwrap_prev_frame_num;
         }
     }
 
@@ -1479,7 +1494,7 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
                                           last_pic_structure == PICT_TOP_FIELD);
             }
         } else {
-            if (h->cur_pic_ptr->frame_num != h->poc.frame_num) {
+            if (h->cur_pic_ptr->frame_num != poc->frame_num) {
                 /* This and previous field were reference, but had
                  * different frame_nums. Consider this field first in
                  * pair. Throw away previous field except for reference
@@ -1511,11 +1526,11 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
         }
     }
 
-    while (h->poc.frame_num != h->poc.prev_frame_num && !h->first_field &&
-           h->poc.frame_num != (h->poc.prev_frame_num + 1) % (1 << sps->log2_max_frame_num)) {
+    while (poc->frame_num != poc->prev_frame_num && !h->first_field &&
+           poc->frame_num != (poc->prev_frame_num + 1) % (1 << sps->log2_max_frame_num)) {
         const H264Picture *prev = h->short_ref_count ? h->short_ref[0] : NULL;
         av_log(h->avctx, AV_LOG_DEBUG, "Frame num gap %d %d\n",
-               h->poc.frame_num, h->poc.prev_frame_num);
+               poc->frame_num, poc->prev_frame_num);
         if (!sps->gaps_in_frame_num_allowed_flag)
             for(i=0; i<FF_ARRAY_ELEMS(h->last_pocs); i++)
                 h->last_pocs[i] = INT_MIN;
@@ -1525,9 +1540,9 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
             return ret;
         }
 
-        h->poc.prev_frame_num++;
-        h->poc.prev_frame_num        %= 1 << sps->log2_max_frame_num;
-        h->cur_pic_ptr->frame_num = h->poc.prev_frame_num;
+        poc->prev_frame_num++;
+        poc->prev_frame_num        %= 1 << sps->log2_max_frame_num;
+        h->cur_pic_ptr->frame_num = poc->prev_frame_num;
         h->cur_pic_ptr->invalid_gap = !sps->gaps_in_frame_num_allowed_flag;
         ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX, 0);
         ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX, 1);
@@ -1573,7 +1588,7 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
                     color_frame(h->short_ref[0]->f, c);
                 h->short_ref[0]->gray = 1;
             }
-            h->short_ref[0]->frame_num = h->poc.prev_frame_num;
+            h->short_ref[0]->frame_num = poc->prev_frame_num;
         }
     }
 
@@ -1594,7 +1609,7 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
             h->first_field = FIELD_PICTURE(h);
         } else {
             h->missing_fields = 0;
-            if (h->cur_pic_ptr->frame_num != h->poc.frame_num) {
+            if (h->cur_pic_ptr->frame_num != poc->frame_num) {
                 ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX,
                                           h->picture_structure==PICT_BOTTOM_FIELD);
                 /* This and the previous field had different frame_nums.
@@ -1639,7 +1654,7 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
     }
 
     ret = ff_h264_init_poc(h->cur_pic_ptr->field_poc, &h->cur_pic_ptr->poc,
-                     h->ps.sps, &h->poc, h->picture_structure, nal->ref_idc);
+                     h->ps.sps, poc, h->picture_structure, nal->ref_idc);
     if (ret < 0)
         return ret;
 
@@ -1658,15 +1673,15 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
     if (h->sei.recovery_point.recovery_frame_cnt >= 0) {
         const int sei_recovery_frame_cnt = h->sei.recovery_point.recovery_frame_cnt;
 
-        if (h->poc.frame_num != sei_recovery_frame_cnt || sl->slice_type_nos != AV_PICTURE_TYPE_I)
+        if (poc->frame_num != sei_recovery_frame_cnt || sl->slice_type_nos != AV_PICTURE_TYPE_I)
             h->valid_recovery_point = 1;
 
         if (   h->recovery_frame < 0
-            || av_zero_extend(h->recovery_frame - h->poc.frame_num, h->ps.sps->log2_max_frame_num) > sei_recovery_frame_cnt) {
-            h->recovery_frame = av_zero_extend(h->poc.frame_num + sei_recovery_frame_cnt, h->ps.sps->log2_max_frame_num);
+            || av_zero_extend(h->recovery_frame - poc->frame_num, h->ps.sps->log2_max_frame_num) > sei_recovery_frame_cnt) {
+            h->recovery_frame = av_zero_extend(poc->frame_num + sei_recovery_frame_cnt, h->ps.sps->log2_max_frame_num);
 
             if (!h->valid_recovery_point)
-                h->recovery_frame = h->poc.frame_num;
+                h->recovery_frame = poc->frame_num;
         }
     }
 
@@ -1679,7 +1694,7 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
         h->frame_recovered |= FRAME_RECOVERED_IDR;
     }
 
-    if (h->recovery_frame == h->poc.frame_num && nal->ref_idc) {
+    if (h->recovery_frame == poc->frame_num && nal->ref_idc) {
         h->recovery_frame = -1;
         h->cur_pic_ptr->recovered |= FRAME_RECOVERED_SEI;
     }
@@ -1761,9 +1776,10 @@ static int h264_slice_header_parse(const H264Context *h, H264SliceContext *sl,
 
     sl->frame_num = get_bits(&sl->gb, sps->log2_max_frame_num);
     if (!first_slice) {
-        if (h->poc.frame_num != sl->frame_num) {
+        const H264POCContext *poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
+        if (poc->frame_num != sl->frame_num) {
             av_log(h->avctx, AV_LOG_ERROR, "Frame num change from %d to %d\n",
-                   h->poc.frame_num, sl->frame_num);
+                   poc->frame_num, sl->frame_num);
             return AVERROR_INVALIDDATA;
         }
     }

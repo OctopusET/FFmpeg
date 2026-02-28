@@ -195,13 +195,15 @@ int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup)
     h->mb_y = 0;
 
     if (in_setup || !(avctx->active_thread_type & FF_THREAD_FRAME)) {
+        /* Select per-view POC context for MVC (H.264 Annex H) */
+        H264POCContext *const poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
         if (!h->droppable) {
             err = ff_h264_execute_ref_pic_marking(h);
-            h->poc.prev_poc_msb = h->poc.poc_msb;
-            h->poc.prev_poc_lsb = h->poc.poc_lsb;
+            poc->prev_poc_msb = poc->poc_msb;
+            poc->prev_poc_lsb = poc->poc_lsb;
         }
-        h->poc.prev_frame_num_offset = h->poc.frame_num_offset;
-        h->poc.prev_frame_num        = h->poc.frame_num;
+        poc->prev_frame_num_offset = poc->frame_num_offset;
+        poc->prev_frame_num        = poc->frame_num;
     }
 
     if (avctx->hwaccel) {

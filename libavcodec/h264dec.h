@@ -481,6 +481,27 @@ typedef struct H264Context {
 
     H264POCContext poc;
 
+    /**
+     * POC context for MVC dependent view (view_id > 0).
+     *
+     * In MVC, each view maintains independent POC state (poc_lsb,
+     * poc_msb, delta_poc_bottom, prev_poc_msb/lsb, etc.) because
+     * each view's slice headers carry their own POC parameters.
+     * They share the same frame_num within an access unit, but
+     * the prev_* tracking must be per-view to avoid the dependent
+     * view overwriting the base view's POC state.
+     *
+     * h->poc is always the base view (view_id == 0).
+     * h->dep_view_poc is for the first dependent view (view_id > 0).
+     *
+     * Code in h264_field_start, ff_h264_field_end, and MMCO_RESET
+     * selects the correct context via:
+     *   H264POCContext *poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
+     *
+     * For non-MVC streams, dep_view_poc is never used.
+     */
+    H264POCContext dep_view_poc;
+
     H264Ref default_ref[2];
     H264Picture *short_ref[32];
     H264Picture *long_ref[32];

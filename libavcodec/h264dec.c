@@ -303,9 +303,11 @@ static int h264_init_context(AVCodecContext *avctx, H264Context *h)
     h->workaround_bugs       = avctx->workaround_bugs;
     h->flags                 = avctx->flags;
     h->poc.prev_poc_msb      = 1 << 16;
+    h->poc.prev_frame_num    = -1;
+    h->dep_view_poc.prev_poc_msb = 1 << 16;
+    h->dep_view_poc.prev_frame_num = -1;
     h->recovery_frame        = -1;
     h->frame_recovered       = 0;
-    h->poc.prev_frame_num    = -1;
     h->sei.common.frame_packing.arrangement_cancel_flag = -1;
     h->sei.common.unregistered.x264_build = -1;
 
@@ -453,6 +455,11 @@ static void idr(H264Context *h)
     h->poc.prev_frame_num_offset = 0;
     h->poc.prev_poc_msb          = 1<<16;
     h->poc.prev_poc_lsb          = -1;
+    /* MVC: reset dependent view POC context too */
+    h->dep_view_poc.prev_frame_num        =
+    h->dep_view_poc.prev_frame_num_offset = 0;
+    h->dep_view_poc.prev_poc_msb          = 1<<16;
+    h->dep_view_poc.prev_poc_lsb          = -1;
     for (i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++)
         h->last_pocs[i] = INT_MIN;
 }
@@ -467,6 +474,7 @@ void ff_h264_flush_change(H264Context *h)
     idr(h);
 
     h->poc.prev_frame_num = -1;
+    h->dep_view_poc.prev_frame_num = -1;
     if (h->cur_pic_ptr) {
         h->cur_pic_ptr->reference = 0;
         for (j=i=0; h->delayed_pic[i]; i++)
