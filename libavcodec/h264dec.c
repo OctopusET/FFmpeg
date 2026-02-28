@@ -518,6 +518,7 @@ static int get_last_needed_nal(H264Context *h)
          * can't start the next thread until we've read all of them */
         switch (nal->type) {
         case H264_NAL_SPS:
+        case H264_NAL_SUB_SPS:
         case H264_NAL_PPS:
             nals_needed = i;
             break;
@@ -726,6 +727,14 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                                                        nal->size_bits);
             if (ret < 0 && (h->avctx->err_recognition & AV_EF_EXPLODE))
                 goto end;
+            break;
+        case H264_NAL_SUB_SPS: {
+            GetBitContext tmp_gb = nal->gb;
+            ff_h264_decode_seq_parameter_set(&tmp_gb, avctx, &h->ps, 0);
+            break;
+        }
+        case H264_NAL_PREFIX:
+        case H264_NAL_EXTEN_SLICE:
             break;
         case H264_NAL_AUD:
         case H264_NAL_END_SEQUENCE:
