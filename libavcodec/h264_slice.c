@@ -436,6 +436,9 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
     h->explicit_ref_marking = h1->explicit_ref_marking;
     h->long_ref_count  = h1->long_ref_count;
     h->short_ref_count = h1->short_ref_count;
+    h->picture_idr     = h1->picture_idr;
+    h->cur_view_id     = h1->cur_view_id;
+    h->idr_pic_flag    = h1->idr_pic_flag;
 
     copy_picture_range(h->short_ref, h1->short_ref, 32, h, h1);
     copy_picture_range(h->long_ref, h1->long_ref, 32, h, h1);
@@ -2133,7 +2136,14 @@ int ff_h264_queue_decode_slice(H264Context *h, const H2645NAL *nal)
                  */
                 if (h->cur_pic_ptr->view_id == h->cur_view_id)
                     av_log(h->avctx, AV_LOG_WARNING, "Broken frame packetizing\n");
-                ret = ff_h264_field_end(h, h->slice_ctx, 1);
+                /*
+                 * With frame threading, the thread update function runs
+                 * execute_ref_pic_marking. Passing in_setup=1 here would
+                 * cause it to run twice, triggering "illegal short term
+                 * buffer state". Only run it here for non-frame-threaded.
+                 */
+                ret = ff_h264_field_end(h, h->slice_ctx,
+                                        !(h->avctx->active_thread_type & FF_THREAD_FRAME));
                 ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX, 0);
                 ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX, 1);
                 h->cur_pic_ptr = NULL;
