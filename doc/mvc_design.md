@@ -539,63 +539,81 @@ Currently, MVC extension slices are silently processed in all threading
 modes. For correctness, frame threading should be disabled when MVC NALs
 are detected.
 
-### Output FIFO (Planned, Not Implemented)
+### Output FIFO (Implemented)
 
-To properly output multiple frames per access unit, the decoder should:
-1. Switch from `FF_CODEC_DECODE_CB` to `FF_CODEC_RECEIVE_FRAME_CB`
-2. Use `AVContainerFifo` to buffer output frames
-3. Push both views' frames into the FIFO (base first, then dependent)
-4. `receive_frame()` drains the FIFO, returning EAGAIN when empty
+The decoder uses `FF_CODEC_RECEIVE_FRAME_CB` with an `AVContainerFifo`
+for buffering output frames. This enables multi-frame output from a single
+decode call:
 
-This follows the same pattern as the HEVC multiview decoder.
+1. `h264_receive_frame()`: manages packet input and FIFO output
+2. `h264_decode_packet()`: core decode logic, pushes frames to FIFO
+3. `h264_flush_delayed_to_fifo()`: drains reorder buffer on EOF
 
-### AV_FRAME_DATA_VIEW_ID Side Data (Planned, Not Implemented)
+For non-MVC streams, the FIFO contains at most one frame per decode call.
+For MVC, both views' frames are pushed and drained one at a time.
 
-Each output frame should carry `AV_FRAME_DATA_VIEW_ID` side data
-(int = view_id) so downstream filters/players can identify which view
-each frame belongs to.
+Frame threading works via `ff_thread_receive_frame()` +
+`ff_thread_get_packet()` (same as HEVC multiview decoder).
+
+### AV_FRAME_DATA_VIEW_ID Side Data (Implemented)
+
+Each output frame carries `AV_FRAME_DATA_VIEW_ID` side data (int = view_id)
+when MVC is active. Additionally, `AVStereo3D` side data is attached with
+`AV_STEREO3D_FRAMESEQUENCE` type: view_id 0 = left (base view),
+view_id > 0 = right (dependent view).
+
+### view_ids Option (Implemented)
+
+Following the HEVC pattern, the `view_ids` AVOption (int array) controls
+which views are decoded and output:
+- Default (empty): base view only
+- `-1`: decode and output all views
+- Specific IDs: decode and output only listed views
+
+The `view_ids_available` AVOption (export, readonly) reports which view IDs
+were detected in the stream.
 
 
 ## 10. Known Issues and Remaining Work
 
-### Known Issues
+### Known Issues (Resolved)
 
-1. **Dependent view IDR not added to short_ref**: The first dependent
-   view IDR (view_id=1, frame_num=0) sometimes fails to be added to
-   `short_ref[]`. This may be because `ff_h264_field_end()` returns an
-   error due to error concealment (the dep IDR's reference list is empty,
-   triggering concealment). If `field_end` returns an error, the calling
-   code returns early, skipping `ref_pic_marking`. Need to investigate
-   whether the error should be non-fatal for dep view IDRs.
+1. **Dependent view IDR not added to short_ref**: Fixed by introducing
+   `idr_pic_flag` (H264Context) to decouple IdrPicFlag from nal_unit_type.
+   MVC anchor pictures (non_idr_flag=0) now correctly read idr_pic_id and
+   dec_ref_pic_marking IDR syntax. `picture_idr` is only set for base view
+   to prevent DPB clearing on dependent view anchors.
 
-2. **Packet ordering**: MPEG-TS PES packets from the dependent view PID
-   may arrive before the base view PID for the same access unit. This
-   means the dependent view's decoder call can't find the inter-view
-   reference (base view not decoded yet). Affects the first few frames
-   in a stream.
+2. **find_short view mismatch**: Fixed by adding view_id matching in
+   `find_short()` -- two MVC views share the same frame_num, so matching
+   frame_num alone returned the wrong picture.
 
-3. **Shared POC context**: Both views share `h->poc`, producing different
+3. **Thread context update**: Fixed by copying `picture_idr`, `cur_view_id`,
+   `idr_pic_flag`, and `mvc_active` in `ff_h264_update_thread_context()`.
+
+### Known Issues (Remaining)
+
+1. **Packet ordering**: MPEG-TS PES packets from the dependent view PID
+   may arrive before the base view PID for the same access unit. Causes
+   1 "Missing reference" error for the first dep non-IDR frame.
+
+2. **Shared POC context**: Both views share `h->poc`, producing different
    POC values for each view. Should be split into per-view POC contexts.
 
-4. **No `receive_frame()`**: Currently uses `decode_frame()` callback
-   which can only return one frame. With MVC, two frames are produced per
-   AU. The second view's frame is currently lost. Need to implement
-   `receive_frame()` with output FIFO.
+3. **Residual errors**: ~3 "illegal short term buffer state" per 200 frames
+   with frame threading. Related to threading interaction with view
+   transitions.
 
-5. **No view selection**: No `view_ids` AVOption to select which views
-   to decode/output. Need to add option following HEVC pattern.
-
-6. **Frame threading**: get_last_needed_nal() doesn't handle NAL type 20
+4. **Frame threading**: `get_last_needed_nal()` doesn't handle NAL type 20
    (EXTEN_SLICE). Should either add it or disable frame threading for MVC.
+
+5. **Non-monotonic DTS**: Both views output frames with the same timestamps,
+   triggering "non monotonically increasing dts" muxer warnings.
 
 ### Remaining Implementation
 
 - [ ] Per-view POC contexts (`H264POCContext view_poc[2]`)
-- [ ] Output FIFO + `receive_frame()` callback
-- [ ] `view_ids` / `view_ids_available` AVOptions
-- [ ] `AV_FRAME_DATA_VIEW_ID` side data on output frames
-- [ ] Disable frame threading when MVC NALs detected
-- [ ] Handle dep view IDR short_ref insertion failure
+- [ ] Handle NAL type 20 in `get_last_needed_nal()` for frame threading
 - [ ] Test with more MVC content (Blu-ray 3D, different cameras)
 
 
@@ -606,9 +624,9 @@ each frame belongs to.
 | File                          | Changes                                      |
 |-------------------------------|----------------------------------------------|
 | `libavformat/mpegts.c`        | MVC PID merging in `pmt_cb()`                |
-| `libavcodec/h264dec.h`        | `H264Picture.view_id`, `H264Context.cur_view_id` |
-| `libavcodec/h264dec.c`        | NAL type 14/15/20 handling in `decode_nal_units()` |
-| `libavcodec/h264_slice.c`     | `pic->view_id = h->cur_view_id` in picture alloc |
+| `libavcodec/h264dec.h`        | `H264Picture.view_id`, `H264Context.{cur_view_id,idr_pic_flag,mvc_active,view_ids,output_fifo}` |
+| `libavcodec/h264dec.c`        | NAL type 14/15/20 handling, `receive_frame`, output FIFO, `view_ids` option, view_id side data |
+| `libavcodec/h264_slice.c`     | `pic->view_id`, `idr_pic_flag` usage, thread context update |
 | `libavcodec/h264_picture.c`   | `view_id` propagation in `h264_copy_picture_params()` |
 | `libavcodec/h264_refs.c`      | Per-view ref lists, inter-view refs, per-view sliding window, per-view DPB overflow |
 | `libavcodec/h264_parser.c`    | MVC NAL type 20 frame boundary, idc 4/5 in reordering |
