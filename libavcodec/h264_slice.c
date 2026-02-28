@@ -439,6 +439,7 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
     h->picture_idr     = h1->picture_idr;
     h->cur_view_id     = h1->cur_view_id;
     h->idr_pic_flag    = h1->idr_pic_flag;
+    h->mvc_active      = h1->mvc_active;
 
     copy_picture_range(h->short_ref, h1->short_ref, 32, h, h1);
     copy_picture_range(h->long_ref, h1->long_ref, 32, h, h1);

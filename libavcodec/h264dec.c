@@ -35,6 +35,7 @@
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/stereo3d.h"
 #include "libavutil/thread.h"
 #include "libavutil/video_enc_params.h"
 
@@ -368,6 +369,7 @@ static av_cold int h264_decode_end(AVCodecContext *avctx)
 
     av_refstruct_pool_uninit(&h->decode_error_flags_pool);
     av_container_fifo_free(&h->output_fifo);
+    av_freep(&h->view_ids_available);
 
     av_freep(&h->slice_ctx);
     h->nb_slice_ctx = 0;
@@ -591,6 +593,28 @@ static void debug_green_metadata(const H264SEIGreenMetaData *gm, void *logctx)
     }
 }
 
+/**
+ * Register a view_id in the view_ids_available export array.
+ * Called when a new view_id is seen in an EXTEN_SLICE NAL.
+ * No-op if the view_id is already registered.
+ */
+static int h264_register_view_id(H264Context *h, int view_id)
+{
+    unsigned *tmp;
+
+    for (unsigned i = 0; i < h->nb_view_ids_available; i++)
+        if (h->view_ids_available[i] == (unsigned)view_id)
+            return 0;
+
+    tmp = av_realloc_array(h->view_ids_available,
+                           h->nb_view_ids_available + 1, sizeof(*tmp));
+    if (!tmp)
+        return AVERROR(ENOMEM);
+    h->view_ids_available = tmp;
+    h->view_ids_available[h->nb_view_ids_available++] = view_id;
+    return 0;
+}
+
 static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                             const uint8_t *buf, int buf_size)
 {
@@ -803,6 +827,44 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             skip_bits(&nal->gb, 6);            // priority_id
             h->cur_view_id = get_bits(&nal->gb, 10);
             skip_bits(&nal->gb, 6);            // temporal_id(3), anchor(1), inter_view(1), reserved(1)
+
+            if (!h->mvc_active) {
+                h->mvc_active = 1;
+                /* Register base view (view_id=0) when MVC is first detected */
+                ret = h264_register_view_id(h, 0);
+                if (ret < 0)
+                    goto end;
+            }
+            ret = h264_register_view_id(h, h->cur_view_id);
+            if (ret < 0)
+                goto end;
+
+            /*
+             * view_ids filtering: skip dependent views not requested.
+             *
+             * Default (nb_view_ids == 0): base view only, skip all
+             * dependent views. Matches HEVC multiview default behavior.
+             *
+             * A single -1: decode and output all views.
+             *
+             * Otherwise: decode only listed view IDs. Base view (0) is
+             * always decoded as reference, but output filtering in
+             * finalize_frame() will skip it if not in the list.
+             */
+            if (h->nb_view_ids == 0) {
+                /* Default: base view only */
+                break;
+            } else if (!(h->nb_view_ids == 1 && h->view_ids[0] == -1)) {
+                int found = 0;
+                for (unsigned j = 0; j < h->nb_view_ids; j++) {
+                    if (h->view_ids[j] == h->cur_view_id) {
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found)
+                    break;
+            }
 
             /*
              * Rewrite NAL type to regular SLICE.
@@ -1031,6 +1093,40 @@ static int output_frame(H264Context *h, AVFrame *dst, H264Picture *srcp)
     if (!(h->avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN))
         av_frame_remove_side_data(dst, AV_FRAME_DATA_FILM_GRAIN_PARAMS);
 
+    /*
+     * MVC: Attach AV_FRAME_DATA_VIEW_ID side data.
+     *
+     * Added for all frames when MVC is active (even base view with
+     * view_id=0), so the caller can distinguish views. Also add
+     * AVStereo3D side data with FRAMESEQUENCE type -- MVC base view
+     * is conventionally left, dependent view is right.
+     */
+    if (h->mvc_active) {
+        AVFrameSideData *sd = av_frame_side_data_new(
+            &dst->side_data, &dst->nb_side_data,
+            AV_FRAME_DATA_VIEW_ID, sizeof(int), 0);
+        if (!sd) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        *(int *)sd->data = srcp->view_id;
+
+        if (!av_frame_get_side_data(dst, AV_FRAME_DATA_STEREO3D)) {
+            AVStereo3D *stereo = av_stereo3d_create_side_data(dst);
+            if (!stereo) {
+                ret = AVERROR(ENOMEM);
+                goto fail;
+            }
+            stereo->type = AV_STEREO3D_FRAMESEQUENCE;
+            /*
+             * MVC convention: view_id 0 = left (base view),
+             * view_id > 0 = right (dependent view).
+             */
+            stereo->view = srcp->view_id == 0 ? AV_STEREO3D_VIEW_LEFT
+                                               : AV_STEREO3D_VIEW_RIGHT;
+        }
+    }
+
     return 0;
 fail:
     av_frame_unref(dst);
@@ -1078,6 +1174,27 @@ static int finalize_frame(H264Context *h, H264Picture *out)
 {
     AVFrame *dst;
     int ret;
+
+    /*
+     * MVC output filtering: skip frames whose view_id is not in the
+     * user-requested view_ids list. The base view (view_id=0) is
+     * always decoded for inter-view reference, but may not be output.
+     *
+     * nb_view_ids == 0 means base view only (skip dep view).
+     * nb_view_ids == 1 && view_ids[0] == -1 means all views.
+     */
+    if (h->mvc_active && h->nb_view_ids > 0 &&
+        !(h->nb_view_ids == 1 && h->view_ids[0] == -1)) {
+        int found = 0;
+        for (unsigned i = 0; i < h->nb_view_ids; i++) {
+            if (h->view_ids[i] == out->view_id) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            return 0;
+    }
 
     if (!((h->avctx->flags & AV_CODEC_FLAG_OUTPUT_CORRUPT) ||
           (h->avctx->flags2 & AV_CODEC_FLAG2_SHOW_ALL) ||
@@ -1308,6 +1425,16 @@ static const AVOption h264_options[] = {
     { "x264_build", "Assume this x264 version if no x264 version found in any SEI", OFFSET(x264_build), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, VD },
     { "skip_gray", "Do not return gray gap frames", OFFSET(skip_gray), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
     { "noref_gray", "Avoid using gray gap frames as references", OFFSET(noref_gray), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
+    { "view_ids",
+        "Array of view IDs that should be decoded and output; "
+        "a single -1 to decode all views (MVC multiview)",
+        .offset = OFFSET(view_ids), .type = AV_OPT_TYPE_INT | AV_OPT_TYPE_FLAG_ARRAY,
+        .min = -1, .max = INT_MAX, .flags = VD },
+    { "view_ids_available",
+        "Array of available view IDs is exported here (MVC multiview)",
+        .offset = OFFSET(view_ids_available),
+        .type = AV_OPT_TYPE_UINT | AV_OPT_TYPE_FLAG_ARRAY,
+        .flags = VDX | AV_OPT_FLAG_READONLY },
     { NULL },
 };
 

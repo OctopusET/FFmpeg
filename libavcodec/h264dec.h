@@ -634,6 +634,32 @@ typedef struct H264Context {
      * decode call, so behavior is equivalent to the old decode_frame API.
      */
     AVContainerFifo *output_fifo;
+
+    /**
+     * Set to 1 when MVC extension slices (NAL type 20) have been seen.
+     * Used to decide whether to add AV_FRAME_DATA_VIEW_ID side data
+     * and populate view_ids_available.
+     */
+    int mvc_active;
+
+    /**
+     * User-requested view IDs to decode and output (AVOption array).
+     *
+     * Empty (nb_view_ids == 0): decode base view only (default).
+     * Single element -1: decode and output all views.
+     * Otherwise: decode and output only the listed view IDs.
+     *
+     * Follows the HEVC multiview decoder pattern.
+     */
+    int *view_ids;
+    unsigned nb_view_ids;
+
+    /**
+     * Available view IDs in the stream (exported AVOption array).
+     * Populated when MVC extension slices are detected.
+     */
+    unsigned *view_ids_available;
+    unsigned nb_view_ids_available;
 } H264Context;
 
 extern const uint16_t ff_h264_mb_sizes[4];
