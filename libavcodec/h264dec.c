@@ -1362,7 +1362,14 @@ static int h264_decode_packet(H264Context *h, AVPacket *avpkt)
 
     if (!(avctx->flags2 & AV_CODEC_FLAG2_CHUNKS) && (!h->cur_pic_ptr || !h->has_slice)) {
         if (avctx->skip_frame >= AVDISCARD_NONREF ||
-            buf_size >= 4 && !memcmp("Q264", buf, 4))
+            buf_size >= 4 && !memcmp("Q264", buf, 4) ||
+            h->mvc_active)
+            /*
+             * mvc_active: when MVC dep view packets are merged into the
+             * base view stream, some packets contain only EXTEN_SLICE
+             * NALs which are skipped by view_ids filtering. These are
+             * not errors -- just empty from the base view's perspective.
+             */
             return 0;
         av_log(avctx, AV_LOG_ERROR, "no frame!\n");
         return AVERROR_INVALIDDATA;
