@@ -162,6 +162,8 @@ typedef struct H264Picture {
     atomic_int *decode_error_flags;
 
     int gray;
+
+    int view_id;            ///< MVC view ID (0 = base view)
 } H264Picture;
 
 typedef struct H264Ref {
@@ -577,6 +579,8 @@ typedef struct H264Context {
     int non_gray;                       ///< Did we encounter a intra frame after a gray gap frame
     int noref_gray;
     int skip_gray;
+
+    int cur_view_id;                    ///< view_id of the NAL currently being decoded
 } H264Context;
 
 extern const uint16_t ff_h264_mb_sizes[4];

@@ -637,6 +637,7 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
         err = 0;
         switch (nal->type) {
         case H264_NAL_IDR_SLICE:
+            h->cur_view_id = 0;
             if ((nal->data[1] & 0xFC) == 0x98) {
                 av_log(h->avctx, AV_LOG_ERROR, "Invalid inter IDR frame\n");
                 h->next_outputed_poc = INT_MIN;
@@ -734,8 +735,61 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             break;
         }
         case H264_NAL_PREFIX:
-        case H264_NAL_EXTEN_SLICE:
             break;
+        case H264_NAL_EXTEN_SLICE: {
+            int non_idr_flag;
+
+            if (get_bits1(&nal->gb)) // svc_extension_flag
+                break; // SVC not supported
+            non_idr_flag = get_bits1(&nal->gb);
+            skip_bits(&nal->gb, 6);            // priority_id
+            h->cur_view_id = get_bits(&nal->gb, 10);
+            skip_bits(&nal->gb, 6);            // temporal_id(3), anchor(1), inter_view(1), reserved(1)
+
+            // Rewrite NAL type so slice header parsing works normally
+            nal->type = non_idr_flag ? H264_NAL_SLICE : H264_NAL_IDR_SLICE;
+            h->nal_unit_type = nal->type;
+
+            if (!non_idr_flag) {
+                if (!idr_cleared)
+                    idr(h);
+                idr_cleared = 1;
+                h->has_recovery_point = 1;
+            }
+
+            h->has_slice = 1;
+
+            if ((err = ff_h264_queue_decode_slice(h, nal))) {
+                H264SliceContext *sl = h->slice_ctx + h->nb_slice_ctx_queued;
+                sl->ref_count[0] = sl->ref_count[1] = 0;
+                break;
+            }
+
+            if (h->current_slice == 1) {
+                if (avctx->active_thread_type & FF_THREAD_FRAME &&
+                    i >= nals_needed && !h->setup_finished && h->cur_pic_ptr) {
+                    ff_thread_finish_setup(avctx);
+                    h->setup_finished = 1;
+                }
+
+                if (h->avctx->hwaccel &&
+                    (ret = FF_HW_CALL(h->avctx, start_frame, buf_ref,
+                                      buf, buf_size)) < 0)
+                    goto end;
+            }
+
+            max_slice_ctx = avctx->hwaccel ? 1 : h->nb_slice_ctx;
+            if (h->nb_slice_ctx_queued == max_slice_ctx) {
+                if (h->avctx->hwaccel) {
+                    ret = FF_HW_CALL(avctx, decode_slice, nal->raw_data, nal->raw_size);
+                    h->nb_slice_ctx_queued = 0;
+                } else
+                    ret = ff_h264_execute_decode_slices(h);
+                if (ret < 0 && (h->avctx->err_recognition & AV_EF_EXPLODE))
+                    goto end;
+            }
+            break;
+        }
         case H264_NAL_AUD:
         case H264_NAL_END_SEQUENCE:
         case H264_NAL_END_STREAM:

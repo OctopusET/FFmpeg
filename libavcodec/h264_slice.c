@@ -531,6 +531,7 @@ static int h264_frame_start(H264Context *h)
         return ret;
 
     h->cur_pic_ptr = pic;
+    pic->view_id = h->cur_view_id;
     ff_h264_unref_picture(&h->cur_pic);
     if (CONFIG_ERROR_RESILIENCE) {
         ff_h264_set_erpic(&h->er.cur_pic, NULL);
