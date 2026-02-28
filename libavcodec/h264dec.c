@@ -543,7 +543,14 @@ static int get_last_needed_nal(H264Context *h)
         case H264_NAL_DPA:
         case H264_NAL_IDR_SLICE:
         case H264_NAL_SLICE:
-            ret = init_get_bits8(&gb, nal->data + 1, nal->size - 1);
+        case H264_NAL_EXTEN_SLICE: {
+            /*
+             * NAL type 20 (EXTEN_SLICE) has a 3-byte MVC extension header
+             * between the 1-byte NAL header and the slice header.
+             * Skip it to reach first_mb_in_slice.
+             */
+            int hdr = nal->type == H264_NAL_EXTEN_SLICE ? 4 : 1;
+            ret = init_get_bits8(&gb, nal->data + hdr, nal->size - hdr);
             if (ret < 0) {
                 av_log(h->avctx, AV_LOG_ERROR, "Invalid zero-sized VCL NAL unit\n");
                 if (h->avctx->err_recognition & AV_EF_EXPLODE)
@@ -565,6 +572,7 @@ static int get_last_needed_nal(H264Context *h)
             picture_intra_only &= (slice_type & 3) == AV_PICTURE_TYPE_I;
             if (!first_slice)
                 first_slice = nal->type;
+        }
         }
     }
 
