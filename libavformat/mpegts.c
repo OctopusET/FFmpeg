@@ -2563,6 +2563,32 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
 
         stream_identifier = parse_stream_identifier_desc(p, p_end) + 1;
 
+        /* MVC dependent view: create PES for packet assembly but share
+         * the base H.264 stream's AVStream instead of creating a new one.
+         * Linking to the base stream is done after the main loop. */
+        if (stream_type == STREAM_TYPE_VIDEO_MVC) {
+            if (ts->pids[pid] && ts->pids[pid]->type == MPEGTS_PES) {
+                pes = ts->pids[pid]->u.pes_filter.opaque;
+            } else {
+                if (ts->pids[pid])
+                    mpegts_close_filter(ts, ts->pids[pid]);
+                pes = add_pes_stream(ts, pid, pcr_pid);
+                if (!pes)
+                    goto out;
+            }
+            pes->stream_type = stream_type;
+            add_pid_to_program(prg, pid);
+            desc_list_len = get16(&p, p_end);
+            if (desc_list_len < 0)
+                goto out;
+            desc_list_len &= 0xfff;
+            desc_list_end  = p + desc_list_len;
+            if (desc_list_end > p_end)
+                goto out;
+            p = desc_list_end;
+            continue;
+        }
+
         /* now create stream */
         if (ts->pids[pid] && ts->pids[pid]->type == MPEGTS_PES) {
             pes = ts->pids[pid]->u.pes_filter.opaque;
@@ -2656,6 +2682,39 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
             }
         }
         p = desc_list_end;
+    }
+
+    /* Link MVC dependent view PES to the base H.264 stream */
+    if (prg) {
+        PESContext *base_pes = NULL;
+        for (int j = 0; j < prg->nb_pids; j++) {
+            int p_pid = prg->pids[j];
+            if (p_pid < NB_PID_MAX && ts->pids[p_pid] &&
+                ts->pids[p_pid]->type == MPEGTS_PES) {
+                PESContext *p_pes = ts->pids[p_pid]->u.pes_filter.opaque;
+                if (p_pes->stream_type == STREAM_TYPE_VIDEO_H264 && p_pes->st) {
+                    base_pes = p_pes;
+                    break;
+                }
+            }
+        }
+        if (base_pes) {
+            for (int j = 0; j < prg->nb_pids; j++) {
+                int p_pid = prg->pids[j];
+                if (p_pid < NB_PID_MAX && ts->pids[p_pid] &&
+                    ts->pids[p_pid]->type == MPEGTS_PES) {
+                    PESContext *p_pes = ts->pids[p_pid]->u.pes_filter.opaque;
+                    if (p_pes->stream_type == STREAM_TYPE_VIDEO_MVC && !p_pes->st) {
+                        p_pes->st = base_pes->st;
+                        p_pes->merged_st = 1;
+                        av_log(ts->stream, AV_LOG_VERBOSE,
+                               "MVC: merged dependent view PID 0x%x "
+                               "with base H.264 PID 0x%x\n",
+                               p_pes->pid, base_pes->pid);
+                    }
+                }
+            }
+        }
     }
 
     if (!ts->pids[pcr_pid])
