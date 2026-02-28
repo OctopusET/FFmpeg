@@ -591,30 +591,41 @@ were detected in the stream.
 3. **Thread context update**: Fixed by copying `picture_idr`, `cur_view_id`,
    `idr_pic_flag`, and `mvc_active` in `ff_h264_update_thread_context()`.
 
+4. **Per-view POC context**: Split `h->poc` into base and dependent view
+   contexts (`h->poc` + `h->dep_view_poc`). Each view's slice headers carry
+   independent POC parameters; without separation the dep view overwrote
+   the base view's prev_poc_msb/lsb tracking.
+
+5. **NAL type 20 in get_last_needed_nal**: Added EXTEN_SLICE handling with
+   4-byte header offset (1 NAL header + 3 MVC extension) to correctly reach
+   first_mb_in_slice.
+
+6. **False errors from dep view packets**: When MVC dep view PES packets
+   merged into the base view stream contain only EXTEN_SLICE NALs (skipped
+   by view_ids filtering), the decoder no longer reports "no frame!" errors.
+   Fixed by checking `h->mvc_active`.
+
 ### Known Issues (Remaining)
 
 1. **Packet ordering**: MPEG-TS PES packets from the dependent view PID
    may arrive before the base view PID for the same access unit. Causes
    1 "Missing reference" error for the first dep non-IDR frame.
 
-2. **Shared POC context**: Both views share `h->poc`, producing different
-   POC values for each view. Should be split into per-view POC contexts.
+2. **Inter-view prediction**: Dependent view P-slices reference the base
+   view picture for inter-view prediction (same POC, different view_id).
+   The ref list builder does not yet add inter-view refs, causing
+   concealment errors (~10-20 per GOP) in the dep view.
 
-3. **Residual errors**: ~3 "illegal short term buffer state" per 200 frames
-   with frame threading. Related to threading interaction with view
-   transitions.
-
-4. **Frame threading**: `get_last_needed_nal()` doesn't handle NAL type 20
-   (EXTEN_SLICE). Should either add it or disable frame threading for MVC.
-
-5. **Non-monotonic DTS**: Both views output frames with the same timestamps,
-   triggering "non monotonically increasing dts" muxer warnings.
+3. **Non-monotonic DTS**: Both views output frames with the same timestamps,
+   triggering "non monotonically increasing dts" muxer warnings. This is
+   expected with frame-sequential stereo output; a proper stereo-aware
+   muxer would handle it.
 
 ### Remaining Implementation
 
-- [ ] Per-view POC contexts (`H264POCContext view_poc[2]`)
-- [ ] Handle NAL type 20 in `get_last_needed_nal()` for frame threading
+- [ ] Inter-view reference prediction (add base view pic to dep view ref list)
 - [ ] Test with more MVC content (Blu-ray 3D, different cameras)
+- [ ] Consider DTS adjustment for frame-sequential stereo output
 
 
 ## 11. File Map
@@ -624,11 +635,11 @@ were detected in the stream.
 | File                          | Changes                                      |
 |-------------------------------|----------------------------------------------|
 | `libavformat/mpegts.c`        | MVC PID merging in `pmt_cb()`                |
-| `libavcodec/h264dec.h`        | `H264Picture.view_id`, `H264Context.{cur_view_id,idr_pic_flag,mvc_active,view_ids,output_fifo}` |
-| `libavcodec/h264dec.c`        | NAL type 14/15/20 handling, `receive_frame`, output FIFO, `view_ids` option, view_id side data |
-| `libavcodec/h264_slice.c`     | `pic->view_id`, `idr_pic_flag` usage, thread context update |
-| `libavcodec/h264_picture.c`   | `view_id` propagation in `h264_copy_picture_params()` |
-| `libavcodec/h264_refs.c`      | Per-view ref lists, inter-view refs, per-view sliding window, per-view DPB overflow |
+| `libavcodec/h264dec.h`        | `H264Picture.view_id`, `H264Context.{cur_view_id,idr_pic_flag,mvc_active,dep_view_poc,view_ids,output_fifo}` |
+| `libavcodec/h264dec.c`        | NAL type 14/15/20 handling, `receive_frame`, output FIFO, `view_ids` option, view_id side data, `get_last_needed_nal` NAL 20 |
+| `libavcodec/h264_slice.c`     | `pic->view_id`, `idr_pic_flag` usage, thread context update, per-view POC in `h264_field_start` |
+| `libavcodec/h264_picture.c`   | `view_id` propagation, per-view POC in `ff_h264_field_end` |
+| `libavcodec/h264_refs.c`      | Per-view ref lists, inter-view refs, per-view sliding window, per-view DPB overflow, per-view MMCO_RESET |
 | `libavcodec/h264_parser.c`    | MVC NAL type 20 frame boundary, idc 4/5 in reordering |
 
 ### Pre-existing Files (Phase 1-2, already committed)
