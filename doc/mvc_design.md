@@ -666,3 +666,50 @@ were detected in the stream.
 | 8.2.4.3      | Reference picture list modification            |
 | 8.2.5        | Decoded reference picture marking              |
 | 8.2.5.3      | Sliding window reference picture marking       |
+
+---
+
+## Implementation Status
+
+| Area | Status | Description |
+|------|--------|-------------|
+| CBS MVC parsing | Done | Bitstream parsing for Subset SPS, NAL type 14/20 |
+| H.264 parser | Done | MVC NAL type recognition in the parser |
+| extract_extradata BSF | Done | MVC NAL support for extradata extraction |
+| MPEG-TS stream merging | Done | Merges dep view PID into base H.264 stream |
+| MPEG-TS SSIF lazy linking | Done | Blu-ray 3D SSIF file support |
+| MVC slice decoding | Done | NAL type 20 rewrite to SLICE, full decode |
+| Per-view POC | Done | Independent POC tracking per view |
+| Per-view reference mgmt | Done | DPB filtering by view_id, inter-view refs |
+| Output FIFO (receive_frame) | Done | Multi-frame output for multiview |
+| MVC packet reordering | Done | Fixes MPEG-TS PES ordering issues |
+| view_ids option | Done | User selects which views to decode |
+| AV_FRAME_DATA_VIEW_ID | Done | View ID side data on output frames |
+| Stereo3D side data | Done | AV_STEREO3D_FRAMESEQUENCE with left/right |
+| FATE test | Done | 52-frame regression test |
+
+## Known Limitations
+
+- **Interlaced MVC**: dep view skipped (field-pair ref management needs work)
+- **Frame threading + MVC**: dep view skipped (inter-view ref needs base
+  view decoded in same thread context)
+- **>2 views**: only stereo (2 views) tested; inter-view ref lookup
+  hardcodes view_id=0 as base
+- **idc=5 long-term ref**: logs warning, not implemented (rarely used)
+- **MVC in MP4/MKV**: only MPEG-TS tested; may need container work
+- **Hardware acceleration**: MVC slices use software decode path only
+- **SSIF**: 1-2 frames lost at stream start (lazy linking timing)
+- **View specifiers** (`-map 0:v:vpos:left`): don't work for MPEG-TS MVC
+  because Subset SPS arrives too late; use `-view_ids -1` instead
+
+## Future Work
+
+1. **More samples**: different containers, interlaced, B-frame heavy, >2 views
+2. **Clean patch series**: reimplement from `doc/mvc_upstream_guide.md`
+3. **MP4/MKV container support**: if needed based on sample testing
+4. **Interlaced MVC**: field-pair ref management for interlaced streams
+5. **Hardware acceleration**: extend hwaccel backends for MVC NAL types
+
+Note: other stereoscopic 3D formats (frame-packing, side-by-side, top-bottom)
+are already supported by FFmpeg and do not require MVC decoding. MVC is
+specifically for Blu-ray 3D and similar multi-PID multiview bitstreams.

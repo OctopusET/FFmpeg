@@ -1255,13 +1255,61 @@ Must be uploaded to `samples.ffmpeg.org`.
 
 ---
 
-## Known Limitations (document in commit messages)
+## Implementation Status
 
-- Interlaced MVC: dep view skipped (pre-existing PATCHWELCOME)
-- Frame threading: dep view skipped (single-DPB, needs base in same thread)
-- SSIF: 1-2 frames lost at stream start (lazy linking timing)
-- View specifiers (`-map 0:v:vpos:left`): don't work for MPEG-TS MVC
+| Area | Status | Description |
+|------|--------|-------------|
+| CBS MVC parsing | Done | Bitstream parsing for Subset SPS, NAL type 14/20 |
+| H.264 parser | Done | MVC NAL type recognition in the parser |
+| extract_extradata BSF | Done | MVC NAL support for extradata extraction |
+| MPEG-TS stream merging | Done | Merges dep view PID into base H.264 stream |
+| MPEG-TS SSIF lazy linking | Done | Blu-ray 3D SSIF file support |
+| MVC slice decoding | Done | NAL type 20 rewrite to SLICE, full decode |
+| Per-view POC | Done | Independent POC tracking per view |
+| Per-view reference mgmt | Done | DPB filtering by view_id, inter-view refs |
+| Output FIFO (receive_frame) | Done | Multi-frame output for multiview |
+| MVC packet reordering | Done | Fixes MPEG-TS PES ordering issues |
+| view_ids option | Done | User selects which views to decode |
+| AV_FRAME_DATA_VIEW_ID | Done | View ID side data on output frames |
+| Stereo3D side data | Done | AV_STEREO3D_FRAMESEQUENCE with left/right |
+| FATE test | Done | 52-frame regression test |
+
+---
+
+## Known Limitations
+
+- **Interlaced MVC**: dep view skipped (field-pair ref management needs work)
+- **Frame threading + MVC**: dep view skipped (single-DPB, inter-view ref
+  needs base view decoded in same thread context)
+- **>2 views**: only stereo (2 views) tested; inter-view ref lookup
+  hardcodes view_id=0 as base
+- **idc=5 long-term ref**: logs warning, not implemented (rarely used
+  in stereo MVC content)
+- **MVC in MP4/MKV**: only MPEG-TS tested; MP4/MKV may need container
+  support work
+- **Hardware acceleration**: MVC slices go through software decode path only
+- **SSIF**: 1-2 frames lost at stream start (lazy linking timing)
+- **View specifiers** (`-map 0:v:vpos:left`): don't work for MPEG-TS MVC
   because Subset SPS arrives too late; use `-view_ids -1` instead
+
+---
+
+## Future Work
+
+1. **More samples**: test with different containers (MP4, MKV), interlaced
+   content, B-frame heavy streams, >2 views
+2. **Reimplement clean patches**: use this guide to write a clean 11-patch
+   series for ffmpeg-devel submission
+3. **MP4/MKV container support**: if samples reveal issues with non-MPEG-TS
+   containers
+4. **Interlaced MVC**: implement field-pair ref management for interlaced
+   MVC streams, if demand and test samples exist
+5. **Hardware acceleration**: extend hwaccel backends for MVC NAL types
+
+Note: other stereoscopic 3D formats (frame-packing, side-by-side, top-bottom)
+are already supported by FFmpeg natively and do not require MVC decoding.
+MVC is specifically for Blu-ray 3D and similar multi-PID/multi-NAL multiview
+bitstreams.
 
 ---
 
