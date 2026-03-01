@@ -1218,11 +1218,33 @@ static int mpegts_push_data(MpegTSFilter *filter,
                         if (ts->merge_pmt_versions)
                             goto skip; /* wait for PMT to merge new stream */
 
-                        pes->st = avformat_new_stream(ts->stream, NULL);
-                        if (!pes->st)
-                            return AVERROR(ENOMEM);
-                        pes->st->id = pes->pid;
-                        mpegts_set_stream_info(pes->st, pes, 0, 0);
+                        /* MVC dependent view (SSIF): link to base H.264
+                         * stream instead of creating a separate stream.
+                         * In Blu-ray 3D SSIF files, the base and dependent
+                         * view PIDs appear in separate alternating PMTs,
+                         * so the pmt_cb linking code cannot match them.
+                         * Lazy-link here when data arrives. */
+                        if (pes->stream_type == STREAM_TYPE_VIDEO_MVC) {
+                            for (unsigned i = 0; i < ts->stream->nb_streams; i++) {
+                                AVStream *cand = ts->stream->streams[i];
+                                if (cand->codecpar->codec_id == AV_CODEC_ID_H264) {
+                                    pes->st = cand;
+                                    pes->merged_st = 1;
+                                    av_log(ts->stream, AV_LOG_VERBOSE,
+                                           "MVC: linked dependent view PID 0x%x "
+                                           "to H.264 stream\n", pes->pid);
+                                    break;
+                                }
+                            }
+                            if (!pes->st)
+                                goto skip;
+                        } else {
+                            pes->st = avformat_new_stream(ts->stream, NULL);
+                            if (!pes->st)
+                                return AVERROR(ENOMEM);
+                            pes->st->id = pes->pid;
+                            mpegts_set_stream_info(pes->st, pes, 0, 0);
+                        }
                     }
 
                     pes->PES_packet_length = AV_RB16(pes->header + 4);
