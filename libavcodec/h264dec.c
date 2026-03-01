@@ -613,34 +613,51 @@ static void debug_green_metadata(const H264SEIGreenMetaData *gm, void *logctx)
 }
 
 /**
+ * Check if view_id is in the user-requested view_ids list.
+ * Returns 1 if the view should be decoded, 0 to skip.
+ */
+static int h264_view_requested(const H264Context *h, int view_id)
+{
+    if (h->nb_view_ids == 0)
+        return view_id == 0;
+    if (h->nb_view_ids == 1 && h->view_ids[0] == -1)
+        return 1;
+    for (unsigned i = 0; i < h->nb_view_ids; i++)
+        if (h->view_ids[i] == view_id)
+            return 1;
+    return 0;
+}
+
+/**
  * Register a view_id in the view_ids_available export array.
  * Called when a new view_id is seen in an EXTEN_SLICE NAL.
  * No-op if the view_id is already registered.
  */
 static int h264_register_view_id(H264Context *h, int view_id)
 {
-    unsigned *tmp;
+    unsigned *ids, *pos;
+    unsigned n = h->nb_view_ids_available;
 
-    for (unsigned i = 0; i < h->nb_view_ids_available; i++)
+    for (unsigned i = 0; i < n; i++)
         if (h->view_ids_available[i] == (unsigned)view_id)
             return 0;
 
-    tmp = av_realloc_array(h->view_ids_available,
-                           h->nb_view_ids_available + 1, sizeof(*tmp));
-    if (!tmp)
+    ids = av_realloc_array(h->view_ids_available, n + 1, sizeof(*ids));
+    pos = av_realloc_array(h->view_pos_available, n + 1, sizeof(*pos));
+    if (!ids || !pos) {
+        if (ids != h->view_ids_available) av_free(ids);
+        if (pos != h->view_pos_available) av_free(pos);
         return AVERROR(ENOMEM);
-    h->view_ids_available = tmp;
+    }
+    h->view_ids_available = ids;
+    h->view_pos_available = pos;
 
-    tmp = av_realloc_array(h->view_pos_available,
-                           h->nb_view_pos_available + 1, sizeof(*tmp));
-    if (!tmp)
-        return AVERROR(ENOMEM);
-    h->view_pos_available = tmp;
-
-    h->view_ids_available[h->nb_view_ids_available++] = view_id;
+    h->view_ids_available[n] = view_id;
     /* MVC convention: view_id 0 = left (base), view_id > 0 = right */
-    h->view_pos_available[h->nb_view_pos_available++] =
+    h->view_pos_available[n] =
         view_id == 0 ? AV_STEREO3D_VIEW_LEFT : AV_STEREO3D_VIEW_RIGHT;
+    h->nb_view_ids_available = n + 1;
+    h->nb_view_pos_available = n + 1;
     return 0;
 }
 
@@ -874,20 +891,8 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
 
             /* view_ids filtering: skip views not requested by the user.
              * Default (empty): base view only. -1: all views. */
-            if (h->nb_view_ids == 0) {
-                /* Default: base view only */
+            if (!h264_view_requested(h, h->cur_view_id))
                 break;
-            } else if (!(h->nb_view_ids == 1 && h->view_ids[0] == -1)) {
-                int found = 0;
-                for (unsigned j = 0; j < h->nb_view_ids; j++) {
-                    if (h->view_ids[j] == h->cur_view_id) {
-                        found = 1;
-                        break;
-                    }
-                }
-                if (!found)
-                    break;
-            }
 
             /* MVC dep view needs base view as inter-view ref,
              * not available with frame threading. */
@@ -1164,22 +1169,9 @@ static int finalize_frame(H264Context *h, H264Picture *out)
      * MVC output filtering: skip frames whose view_id is not in the
      * user-requested view_ids list. The base view (view_id=0) is
      * always decoded for inter-view reference, but may not be output.
-     *
-     * nb_view_ids == 0 means base view only (skip dep view).
-     * nb_view_ids == 1 && view_ids[0] == -1 means all views.
      */
-    if (h->mvc_active && h->nb_view_ids > 0 &&
-        !(h->nb_view_ids == 1 && h->view_ids[0] == -1)) {
-        int found = 0;
-        for (unsigned i = 0; i < h->nb_view_ids; i++) {
-            if (h->view_ids[i] == out->view_id) {
-                found = 1;
-                break;
-            }
-        }
-        if (!found)
-            return 0;
-    }
+    if (h->mvc_active && !h264_view_requested(h, out->view_id))
+        return 0;
 
     if (!((h->avctx->flags & AV_CODEC_FLAG_OUTPUT_CORRUPT) ||
           (h->avctx->flags2 & AV_CODEC_FLAG2_SHOW_ALL) ||
@@ -1374,12 +1366,13 @@ static int h264_is_dep_view_packet(const uint8_t *buf, int buf_size)
     int has_dep = 0;
 
     for (int i = 0; i + 3 < buf_size; ) {
-        if (buf[i] || buf[i + 1])  {
+        int nal_start;
+
+        if (buf[i] || buf[i + 1]) {
             i++;
             continue;
         }
 
-        int nal_start;
         if (buf[i + 2] == 1)
             nal_start = i + 3;
         else if (buf[i + 2] == 0 && i + 3 < buf_size && buf[i + 3] == 1)
@@ -1412,9 +1405,13 @@ static int h264_is_dep_view_packet(const uint8_t *buf, int buf_size)
  */
 static int h264_drain_mvc_pending(H264Context *h)
 {
-    AVPacket *pkt = av_packet_alloc();
+    AVPacket *pkt;
     int ret = 0;
 
+    if (!h->mvc_pending_pkts.head)
+        return 0;
+
+    pkt = av_packet_alloc();
     if (!pkt)
         return AVERROR(ENOMEM);
 

@@ -441,7 +441,9 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                 break;
             }
             case 5:
-                /* MVC inter-view long-term ref modification (idc=5). */
+                /* MVC inter-view long-term ref modification (idc=5), not supported. */
+                av_log(h->avctx, AV_LOG_WARNING,
+                       "MVC inter-view long-term ref modification not supported\n");
                 i = -1;
                 break;
             default:
