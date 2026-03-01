@@ -373,6 +373,7 @@ static av_cold int h264_decode_end(AVCodecContext *avctx)
     av_container_fifo_free(&h->output_fifo);
     avpriv_packet_list_free(&h->mvc_pending_pkts);
     av_freep(&h->view_ids_available);
+    av_freep(&h->view_pos_available);
 
     av_freep(&h->slice_ctx);
     h->nb_slice_ctx = 0;
@@ -629,7 +630,17 @@ static int h264_register_view_id(H264Context *h, int view_id)
     if (!tmp)
         return AVERROR(ENOMEM);
     h->view_ids_available = tmp;
+
+    tmp = av_realloc_array(h->view_pos_available,
+                           h->nb_view_pos_available + 1, sizeof(*tmp));
+    if (!tmp)
+        return AVERROR(ENOMEM);
+    h->view_pos_available = tmp;
+
     h->view_ids_available[h->nb_view_ids_available++] = view_id;
+    /* MVC convention: view_id 0 = left (base), view_id > 0 = right */
+    h->view_pos_available[h->nb_view_pos_available++] =
+        view_id == 0 ? AV_STEREO3D_VIEW_LEFT : AV_STEREO3D_VIEW_RIGHT;
     return 0;
 }
 
@@ -786,16 +797,46 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
              *
              * Contains a regular SPS followed by MVC extension fields
              * (num_views, view dependencies, applicable operation points).
-             * We parse it as a regular SPS to get resolution/profile info.
-             * The MVC-specific fields are currently ignored -- view
-             * detection happens at runtime from EXTEN_SLICE NAL headers.
+             * We parse the regular SPS for resolution/profile info, then
+             * read view_ids from the MVC extension to populate
+             * view_ids_available early (needed for view specifiers in
+             * fftools before the first EXTEN_SLICE arrives).
              *
              * The Subset SPS arrives on the dependent view's PID in
              * MPEG-TS. After stream merging, it appears on the same
              * AVStream as the base SPS.
              */
             GetBitContext tmp_gb = nal->gb;
+            int profile_idc = nal->data[1]; /* first SPS byte after NAL hdr */
+
             ff_h264_decode_seq_parameter_set(&tmp_gb, avctx, &h->ps, 0);
+
+            /*
+             * Parse the MVC extension to extract view_ids (H.7.3.2.1.4).
+             * After the SPS data, for profiles 118/128:
+             *   bit_equal_to_one (1), num_views_minus1 (ue),
+             *   view_id[0..num_views_minus1] (ue each).
+             */
+            if ((profile_idc == 118 || profile_idc == 128) &&
+                get_bits_left(&tmp_gb) > 1) {
+                unsigned num_views;
+
+                skip_bits(&tmp_gb, 1);  /* bit_equal_to_one */
+                num_views = get_ue_golomb_long(&tmp_gb) + 1;
+                if (num_views > 0 && num_views <= 1024 &&
+                    get_bits_left(&tmp_gb) >= 0) {
+                    if (!h->mvc_active)
+                        h->mvc_active = 1;
+                    for (unsigned i = 0; i < num_views; i++) {
+                        int vid = get_ue_golomb_long(&tmp_gb);
+                        if (vid >= 0 && vid <= 1023) {
+                            ret = h264_register_view_id(h, vid);
+                            if (ret < 0)
+                                goto end;
+                        }
+                    }
+                }
+            }
             break;
         }
         case H264_NAL_PREFIX:
@@ -1589,6 +1630,17 @@ static const AVOption h264_options[] = {
         .offset = OFFSET(view_ids_available),
         .type = AV_OPT_TYPE_UINT | AV_OPT_TYPE_FLAG_ARRAY,
         .flags = VDX | AV_OPT_FLAG_READONLY },
+    { "view_pos_available",
+        "Array of view positions for view_ids_available, as AVStereo3DView",
+        .offset = OFFSET(view_pos_available),
+        .type = AV_OPT_TYPE_UINT | AV_OPT_TYPE_FLAG_ARRAY,
+        .flags = VDX | AV_OPT_FLAG_READONLY, .unit = "view_pos" },
+        { "unspecified", .type = AV_OPT_TYPE_CONST,
+            .default_val = { .i64 = AV_STEREO3D_VIEW_UNSPEC }, .unit = "view_pos" },
+        { "left",  .type = AV_OPT_TYPE_CONST,
+            .default_val = { .i64 = AV_STEREO3D_VIEW_LEFT },  .unit = "view_pos" },
+        { "right", .type = AV_OPT_TYPE_CONST,
+            .default_val = { .i64 = AV_STEREO3D_VIEW_RIGHT }, .unit = "view_pos" },
     { NULL },
 };
 

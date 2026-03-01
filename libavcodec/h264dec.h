@@ -700,6 +700,14 @@ typedef struct H264Context {
      */
     unsigned *view_ids_available;
     unsigned nb_view_ids_available;
+
+    /**
+     * View positions for view_ids_available (exported AVOption array).
+     * Maps each view_id to AV_STEREO3D_VIEW_LEFT/RIGHT.
+     * MVC convention: view_id 0 = left, view_id > 0 = right.
+     */
+    unsigned *view_pos_available;
+    unsigned nb_view_pos_available;
 } H264Context;
 
 extern const uint16_t ff_h264_mb_sizes[4];
