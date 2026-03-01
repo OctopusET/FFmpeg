@@ -496,23 +496,10 @@ case H264_NAL_EXTEN_SLICE: {
     if (ret < 0)
         goto end;
 
-    /*
-     * view_ids filtering: skip dependent views not requested.
-     */
-    if (h->nb_view_ids == 0) {
-        /* Default: base view only */
+    /* view_ids filtering: skip views not requested by the user.
+     * Default (empty): base view only. -1: all views. */
+    if (!h264_view_requested(h, h->cur_view_id))
         break;
-    } else if (!(h->nb_view_ids == 1 && h->view_ids[0] == -1)) {
-        int found = 0;
-        for (unsigned j = 0; j < h->nb_view_ids; j++) {
-            if (h->view_ids[j] == h->cur_view_id) {
-                found = 1;
-                break;
-            }
-        }
-        if (!found)
-            break;
-    }
 
     /* Skip dep view under frame threading (needs base view in same thread) */
     if (avctx->active_thread_type & FF_THREAD_FRAME) {
@@ -726,11 +713,9 @@ case 4: {
     break;
 }
 case 5:
-    /*
-     * MVC inter-view long-term reference modification.
-     * (modification_of_pic_nums_idc == 5)
-     * Not commonly used in stereo MVC. Treat as no-op.
-     */
+    /* MVC inter-view long-term ref modification (idc=5), not supported. */
+    av_log(h->avctx, AV_LOG_WARNING,
+           "MVC inter-view long-term ref modification not supported\n");
     i = -1;
     break;
 ```
@@ -926,27 +911,37 @@ Scans raw packet data for start codes. Returns 1 if packet has EXTEN_SLICE
 static int h264_is_dep_view_packet(const uint8_t *buf, int buf_size)
 {
     int has_dep = 0;
-    const uint8_t *end = buf + buf_size;
 
-    while (buf < end - 4) {
-        if (buf[0] == 0 && buf[1] == 0 && (buf[2] == 1 || (buf[2] == 0 && buf[3] == 1))) {
-            int off = (buf[2] == 1) ? 3 : 4;
-            if (buf + off < end) {
-                int nal_type = buf[off] & 0x1f;
-                switch (nal_type) {
-                case H264_NAL_SLICE:
-                case H264_NAL_IDR_SLICE:
-                case H264_NAL_DPA:
-                    return 0;  /* has base view slice */
-                case H264_NAL_EXTEN_SLICE:
-                    has_dep = 1;
-                    break;
-                }
-            }
-            buf += off + 1;
-        } else {
-            buf++;
+    for (int i = 0; i + 3 < buf_size; ) {
+        int nal_start;
+
+        if (buf[i] || buf[i + 1]) {
+            i++;
+            continue;
         }
+
+        if (buf[i + 2] == 1)
+            nal_start = i + 3;
+        else if (buf[i + 2] == 0 && i + 3 < buf_size && buf[i + 3] == 1)
+            nal_start = i + 4;
+        else {
+            i++;
+            continue;
+        }
+
+        if (nal_start >= buf_size)
+            break;
+
+        switch (buf[nal_start] & 0x1F) {
+        case H264_NAL_SLICE:
+        case H264_NAL_IDR_SLICE:
+        case H264_NAL_DPA:
+            return 0;  /* has base view slice -- not dep-view-only */
+        case H264_NAL_EXTEN_SLICE:
+            has_dep = 1;
+            break;
+        }
+        i = nal_start + 1;
     }
     return has_dep;
 }
@@ -957,9 +952,13 @@ static int h264_is_dep_view_packet(const uint8_t *buf, int buf_size)
 ```c
 static int h264_drain_mvc_pending(H264Context *h)
 {
-    AVPacket *pkt = av_packet_alloc();
+    AVPacket *pkt;
     int ret = 0;
 
+    if (!h->mvc_pending_pkts.head)
+        return 0;
+
+    pkt = av_packet_alloc();
     if (!pkt)
         return AVERROR(ENOMEM);
 
@@ -1059,45 +1058,71 @@ unsigned *view_pos_available;
 unsigned nb_view_pos_available;
 ```
 
-### 9b. h264_register_view_id helper (h264dec.c)
+### 9b. h264_view_requested helper (h264dec.c)
 
 ```c
-static int h264_register_view_id(H264Context *h, int view_id)
+/**
+ * Check if view_id is in the user-requested view_ids list.
+ * Returns 1 if the view should be decoded, 0 to skip.
+ */
+static int h264_view_requested(const H264Context *h, int view_id)
 {
-    unsigned *tmp;
-
-    for (unsigned i = 0; i < h->nb_view_ids_available; i++)
-        if (h->view_ids_available[i] == (unsigned)view_id)
-            return 0;
-
-    tmp = av_realloc_array(h->view_ids_available,
-                           h->nb_view_ids_available + 1, sizeof(*tmp));
-    if (!tmp)
-        return AVERROR(ENOMEM);
-    h->view_ids_available = tmp;
-
-    tmp = av_realloc_array(h->view_pos_available,
-                           h->nb_view_pos_available + 1, sizeof(*tmp));
-    if (!tmp)
-        return AVERROR(ENOMEM);
-    h->view_pos_available = tmp;
-
-    h->view_ids_available[h->nb_view_ids_available++] = view_id;
-    /* MVC convention: view_id 0 = left (base), view_id > 0 = right */
-    h->view_pos_available[h->nb_view_pos_available++] =
-        view_id == 0 ? AV_STEREO3D_VIEW_LEFT : AV_STEREO3D_VIEW_RIGHT;
+    if (h->nb_view_ids == 0)
+        return view_id == 0;
+    if (h->nb_view_ids == 1 && h->view_ids[0] == -1)
+        return 1;
+    for (unsigned i = 0; i < h->nb_view_ids; i++)
+        if (h->view_ids[i] == view_id)
+            return 1;
     return 0;
 }
 ```
 
-### 9c. Free in h264_decode_end (h264dec.c)
+### 9c. h264_register_view_id helper (h264dec.c)
+
+```c
+/**
+ * Register a view_id in the view_ids_available export array.
+ * Called when a new view_id is seen in an EXTEN_SLICE NAL.
+ * No-op if the view_id is already registered.
+ */
+static int h264_register_view_id(H264Context *h, int view_id)
+{
+    unsigned *ids, *pos;
+    unsigned n = h->nb_view_ids_available;
+
+    for (unsigned i = 0; i < n; i++)
+        if (h->view_ids_available[i] == (unsigned)view_id)
+            return 0;
+
+    ids = av_realloc_array(h->view_ids_available, n + 1, sizeof(*ids));
+    pos = av_realloc_array(h->view_pos_available, n + 1, sizeof(*pos));
+    if (!ids || !pos) {
+        if (ids != h->view_ids_available) av_free(ids);
+        if (pos != h->view_pos_available) av_free(pos);
+        return AVERROR(ENOMEM);
+    }
+    h->view_ids_available = ids;
+    h->view_pos_available = pos;
+
+    h->view_ids_available[n] = view_id;
+    /* MVC convention: view_id 0 = left (base), view_id > 0 = right */
+    h->view_pos_available[n] =
+        view_id == 0 ? AV_STEREO3D_VIEW_LEFT : AV_STEREO3D_VIEW_RIGHT;
+    h->nb_view_ids_available = n + 1;
+    h->nb_view_pos_available = n + 1;
+    return 0;
+}
+```
+
+### 9d. Free in h264_decode_end (h264dec.c)
 
 ```c
 av_freep(&h->view_ids_available);
 av_freep(&h->view_pos_available);
 ```
 
-### 9d. AV_FRAME_DATA_VIEW_ID side data in output_frame (h264dec.c)
+### 9e. AV_FRAME_DATA_VIEW_ID side data in output_frame (h264dec.c)
 
 In `output_frame()`, after existing side data handling:
 
@@ -1125,24 +1150,19 @@ if (h->mvc_active) {
 }
 ```
 
-### 9e. View output filtering in finalize_frame (h264dec.c)
+### 9f. View output filtering in finalize_frame (h264dec.c)
 
 ```c
-if (h->mvc_active && h->nb_view_ids > 0 &&
-    !(h->nb_view_ids == 1 && h->view_ids[0] == -1)) {
-    int found = 0;
-    for (unsigned i = 0; i < h->nb_view_ids; i++) {
-        if (h->view_ids[i] == out->view_id) {
-            found = 1;
-            break;
-        }
-    }
-    if (!found)
-        return 0;  /* skip this view */
-}
+/*
+ * MVC output filtering: skip frames whose view_id is not in the
+ * user-requested view_ids list. The base view (view_id=0) is
+ * always decoded for inter-view reference, but may not be output.
+ */
+if (h->mvc_active && !h264_view_requested(h, out->view_id))
+    return 0;
 ```
 
-### 9f. AVOptions (h264dec.c)
+### 9g. AVOptions (h264dec.c)
 
 ```c
 { "view_ids",
