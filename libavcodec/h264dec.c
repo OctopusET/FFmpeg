@@ -371,6 +371,7 @@ static av_cold int h264_decode_end(AVCodecContext *avctx)
 
     av_refstruct_pool_uninit(&h->decode_error_flags_pool);
     av_container_fifo_free(&h->output_fifo);
+    avpriv_packet_list_free(&h->mvc_pending_pkts);
     av_freep(&h->view_ids_available);
 
     av_freep(&h->slice_ctx);
@@ -498,6 +499,7 @@ static av_cold void h264_decode_flush(AVCodecContext *avctx)
 
     av_container_fifo_drain(h->output_fifo,
                             av_container_fifo_can_read(h->output_fifo));
+    avpriv_packet_list_free(&h->mvc_pending_pkts);
     memset(h->delayed_pic, 0, sizeof(h->delayed_pic));
 
     ff_h264_flush_change(h);
@@ -1408,6 +1410,73 @@ static int h264_decode_packet(H264Context *h, AVPacket *avpkt)
 }
 
 /**
+ * Classify whether an Annex B packet contains only MVC dependent view NALs.
+ *
+ * Scans for start codes (00 00 01 or 00 00 00 01) and checks NAL types.
+ * Returns 1 if the packet has EXTEN_SLICE (type 20) NALs but no regular
+ * SLICE/IDR_SLICE (type 1/5) NALs. Such packets are from the dependent
+ * view and can be deferred to fix MPEG-TS PES ordering issues.
+ */
+static int h264_is_dep_view_packet(const uint8_t *buf, int buf_size)
+{
+    int has_dep = 0;
+
+    for (int i = 0; i + 3 < buf_size; ) {
+        if (buf[i] || buf[i + 1])  {
+            i++;
+            continue;
+        }
+
+        int nal_start;
+        if (buf[i + 2] == 1)
+            nal_start = i + 3;
+        else if (buf[i + 2] == 0 && i + 3 < buf_size && buf[i + 3] == 1)
+            nal_start = i + 4;
+        else {
+            i++;
+            continue;
+        }
+
+        if (nal_start >= buf_size)
+            break;
+
+        switch (buf[nal_start] & 0x1F) {
+        case H264_NAL_SLICE:
+        case H264_NAL_IDR_SLICE:
+        case H264_NAL_DPA:
+            return 0;  /* has base view slice -- not dep-view-only */
+        case H264_NAL_EXTEN_SLICE:
+            has_dep = 1;
+            break;
+        }
+        i = nal_start + 1;
+    }
+    return has_dep;
+}
+
+/**
+ * Drain all accumulated dep-view packets from the pending list.
+ * Called after a base view packet is decoded, so inter-view refs are available.
+ */
+static int h264_drain_mvc_pending(H264Context *h)
+{
+    AVPacket *pkt = av_packet_alloc();
+    int ret = 0;
+
+    if (!pkt)
+        return AVERROR(ENOMEM);
+
+    while (avpriv_packet_list_get(&h->mvc_pending_pkts, pkt) >= 0) {
+        ret = h264_decode_packet(h, pkt);
+        av_packet_unref(pkt);
+        if (ret < 0)
+            break;
+    }
+    av_packet_free(&pkt);
+    return ret;
+}
+
+/**
  * receive_frame callback for the H.264 decoder.
  *
  * Uses an output FIFO to support multi-frame output from a single decode
@@ -1415,11 +1484,21 @@ static int h264_decode_packet(H264Context *h, AVPacket *avpkt)
  * frame per view). For non-MVC streams, the FIFO contains at most one
  * frame per decode call, so behavior is equivalent to the old API.
  *
+ * MVC packet reordering:
+ *   In MPEG-TS with merged PIDs, dependent view PES packets often arrive
+ *   before the base view PES for the same access unit. The parser may also
+ *   split a multi-slice dep view into multiple packets. All of these
+ *   dep-view-only packets are accumulated in mvc_pending_pkts. When a
+ *   base view packet arrives, it is decoded first, then all accumulated
+ *   dep view packets are drained. This ensures the base view picture is
+ *   in short_ref[] before any dep view slice needs it for inter-view
+ *   prediction.
+ *
  * Flow:
  *   1. If the FIFO has frames from a previous decode, return one.
- *   2. Get the next packet via ff_decode_get_packet().
- *   3. On EOF, flush remaining delayed pictures into the FIFO.
- *   4. Decode the packet (pushes frames into the FIFO).
+ *   2. Get packets, accumulating dep-view-only packets in the pending list.
+ *   3. When a base view packet arrives, decode it, then drain all pending.
+ *   4. On EOF, drain pending and flush delayed pictures.
  *   5. Return one frame from the FIFO, or EAGAIN/EOF.
  */
 static int h264_receive_frame(AVCodecContext *avctx, AVFrame *frame)
@@ -1432,9 +1511,13 @@ static int h264_receive_frame(AVCodecContext *avctx, AVFrame *frame)
     if (av_container_fifo_can_read(h->output_fifo))
         goto do_output;
 
+get_packet:
     av_packet_unref(avpkt);
     ret = ff_decode_get_packet(avctx, avpkt);
     if (ret == AVERROR_EOF) {
+        ret = h264_drain_mvc_pending(h);
+        if (ret < 0)
+            return ret;
         ret = h264_flush_delayed_to_fifo(h);
         if (ret < 0)
             return ret;
@@ -1442,7 +1525,21 @@ static int h264_receive_frame(AVCodecContext *avctx, AVFrame *frame)
     } else if (ret < 0)
         return ret;
 
+    /* MVC packet reordering: accumulate dep-view-only packets and decode
+     * them after the base view packet. */
+    if (h->mvc_active && !h->is_avc &&
+        h264_is_dep_view_packet(avpkt->data, avpkt->size)) {
+        avpriv_packet_list_put(&h->mvc_pending_pkts, avpkt, NULL, 0);
+        goto get_packet;
+    }
+
     ret = h264_decode_packet(h, avpkt);
+    if (ret < 0)
+        return ret;
+
+    /* Drain all accumulated dep-view packets now that the base view
+     * picture is in short_ref[]. */
+    ret = h264_drain_mvc_pending(h);
     if (ret < 0)
         return ret;
 

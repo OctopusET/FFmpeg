@@ -33,6 +33,7 @@
 
 #include "cabac.h"
 #include "error_resilience.h"
+#include "packet_internal.h"
 #include "h264_parse.h"
 #include "h264_ps.h"
 #include "h264_sei.h"
@@ -662,6 +663,24 @@ typedef struct H264Context {
      * and populate view_ids_available.
      */
     int mvc_active;
+
+    /**
+     * Deferred dependent view packets for MVC packet reordering.
+     *
+     * In MPEG-TS with merged MVC PIDs, the dependent view PES often arrives
+     * before the base view PES for the same access unit. Additionally, the
+     * parser may split a multi-slice dep view picture into several packets,
+     * all arriving before the base view packet.
+     *
+     * h264_receive_frame() accumulates all consecutive dep-view-only packets
+     * here. When a base view packet arrives, it is decoded first, then all
+     * accumulated dep view packets are drained. This ensures the base view
+     * picture is in short_ref[] before any dep view slice needs it as an
+     * inter-view reference.
+     *
+     * Uses PacketList from packet_internal.h (linked list of AVPackets).
+     */
+    PacketList mvc_pending_pkts;
 
     /**
      * User-requested view IDs to decode and output (AVOption array).
