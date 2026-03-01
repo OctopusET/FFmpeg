@@ -242,24 +242,37 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
      * shared H264POCContext produces different values for each view's
      * poc_lsb. So frame_num is the reliable identifier for "same AU".
      *
-     * If the base view picture is not in short_ref[] yet (can happen due
-     * to MPEG-TS PES packet ordering -- dependent view PES arrives before
-     * base view PES), the inter-view ref is simply not added. This causes
-     * a "reference picture missing" error for that slice, but doesn't
-     * crash. It self-corrects once the base view picture is decoded and
-     * added to short_ref[].
+     * Normally, h264_receive_frame() reorders packets so that the base
+     * view is decoded before the dependent view (fixing MPEG-TS PES
+     * ordering). If the base view picture is still not found (e.g. due
+     * to packet loss), the inter-view ref is simply not added and
+     * error concealment handles the missing reference.
      */
     if (h->cur_view_id) {
         H264Picture *iv_ref = NULL;
         int cur_frame_num = h->cur_pic_ptr->frame_num;
 
-        /* Search the UNFILTERED short_ref[] for the base view (view_id=0)
-         * picture with matching frame_num. We search the unfiltered array
-         * because the base view was excluded from view_short_ref[]. */
-        for (int i = 0; i < h->short_ref_count; i++) {
-            if (h->short_ref[i]->view_id == 0 &&
-                h->short_ref[i]->frame_num == cur_frame_num) {
-                iv_ref = h->short_ref[i];
+        /*
+         * Search the DPB for the base view (view_id=0) picture with
+         * matching frame_num.
+         *
+         * We search the full DPB rather than short_ref[] because
+         * non-reference frames (droppable, nal_ref_idc==0) are never
+         * added to short_ref[] by execute_ref_pic_marking. However,
+         * these frames ARE still in the DPB with DELAYED_PIC_REF set
+         * by h264_select_output_frame, so they haven't been released.
+         *
+         * In MVC, inter-view references are a separate category from
+         * temporal references (H.264 Annex H, H.8.2.1). The base
+         * view picture is needed for inter-view prediction regardless
+         * of whether it is marked as "used for reference" in the
+         * temporal sense.
+         */
+        for (int i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
+            if (h->DPB[i].f->buf[0] &&
+                h->DPB[i].view_id == 0 &&
+                h->DPB[i].frame_num == cur_frame_num) {
+                iv_ref = &h->DPB[i];
                 break;
             }
         }
@@ -275,8 +288,19 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
                     if (!sl->ref_list[list][pos].parent)
                         break;
                 }
-                if (pos < FF_ARRAY_ELEMS(sl->ref_list[0]))
+                if (pos < FF_ARRAY_ELEMS(sl->ref_list[0])) {
                     ref_from_h264pic(&sl->ref_list[list][pos], iv_ref);
+                    /*
+                     * Inter-view references are valid regardless of the
+                     * base view's temporal reference status (H.264 Annex H,
+                     * H.8.2.1). A non-reference base view frame (droppable,
+                     * nal_ref_idc==0) has reference=0 or DELAYED_PIC_REF,
+                     * which would fail the ref list validation check
+                     * (reference & 3) != 3. Override to PICT_FRAME so the
+                     * inter-view ref passes validation.
+                     */
+                    sl->ref_list[list][pos].reference = PICT_FRAME;
+                }
             }
         }
     }
@@ -964,8 +988,19 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
                 }
             }
             if (pic) {
-                av_log(h->avctx, AV_LOG_ERROR, "illegal short term buffer state detected\n");
-                err = AVERROR_INVALIDDATA;
+                /*
+                 * MVC: the parser may split dep view NALs into a
+                 * separate packet AND also combine some into the base
+                 * view packet. The accumulate-and-drain mechanism in
+                 * h264_receive_frame then decodes both, producing a
+                 * duplicate short_ref entry. The old entry was already
+                 * removed above; the new one replaces it. Not an error.
+                 */
+                if (!h->mvc_active) {
+                    av_log(h->avctx, AV_LOG_ERROR,
+                           "illegal short term buffer state detected\n");
+                    err = AVERROR_INVALIDDATA;
+                }
             }
 
             if (h->short_ref_count)
