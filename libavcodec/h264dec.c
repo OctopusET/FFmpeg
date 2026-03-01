@@ -900,6 +900,25 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             }
 
             /*
+             * Interlaced MVC: skip dependent view decoding.
+             *
+             * Interlaced MVC streams have field pairs where the two
+             * fields may have different nal_ref_idc (one reference,
+             * one non-reference). The slice init code rejects this
+             * combination with AVERROR_PATCHWELCOME, causing cascading
+             * errors that lose more frames than we'd decode.
+             *
+             * Skip dep view for interlaced content until the
+             * mixed-reference field pair limitation is resolved.
+             */
+            if (h->ps.sps && !h->ps.sps->frame_mbs_only_flag) {
+                av_log(avctx, AV_LOG_DEBUG,
+                       "MVC: skipping dep view %d (interlaced not supported)\n",
+                       h->cur_view_id);
+                break;
+            }
+
+            /*
              * Rewrite NAL type to regular SLICE.
              *
              * MVC extension slices are always rewritten to NAL_SLICE
