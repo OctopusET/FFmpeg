@@ -883,6 +883,21 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             }
 
             /*
+             * Frame threading: each worker gets one packet from
+             * ff_thread_get_packet. MVC dep view needs the base view
+             * picture as an inter-view reference, but with separate
+             * packets per view, the dep view worker can't access the
+             * base view decoded in a different worker. Skip dep view
+             * decoding under frame threading for now.
+             */
+            if (avctx->active_thread_type & FF_THREAD_FRAME) {
+                av_log(avctx, AV_LOG_DEBUG,
+                       "MVC: skipping dep view %d (frame threading active)\n",
+                       h->cur_view_id);
+                break;
+            }
+
+            /*
              * Rewrite NAL type to regular SLICE.
              *
              * MVC extension slices are always rewritten to NAL_SLICE
