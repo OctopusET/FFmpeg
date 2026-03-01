@@ -103,7 +103,7 @@ static void h264_copy_picture_params(H264Picture *dst, const H264Picture *src)
     dst->mb_height     = src->mb_height;
     dst->mb_stride     = src->mb_stride;
     dst->needs_fg      = src->needs_fg;
-    dst->view_id       = src->view_id;   /* MVC: propagate view_id for thread context updates */
+    dst->view_id       = src->view_id;
 }
 
 int ff_h264_ref_picture(H264Picture *dst, const H264Picture *src)
@@ -195,7 +195,7 @@ int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup)
     h->mb_y = 0;
 
     if (in_setup || !(avctx->active_thread_type & FF_THREAD_FRAME)) {
-        /* Select per-view POC context for MVC (H.264 Annex H) */
+        /* MVC: select per-view POC context */
         H264POCContext *const poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
         if (!h->droppable) {
             err = ff_h264_execute_ref_pic_marking(h);

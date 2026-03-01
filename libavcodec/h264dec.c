@@ -714,6 +714,7 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             h->idr_pic_flag = (nal->type == H264_NAL_IDR_SLICE);
             h->has_slice = 1;
 
+        slice_common:
             if ((err = ff_h264_queue_decode_slice(h, nal))) {
                 H264SliceContext *sl = h->slice_ctx + h->nb_slice_ctx_queued;
                 sl->ref_count[0] = sl->ref_count[1] = 0;
@@ -840,43 +841,16 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             break;
         }
         case H264_NAL_PREFIX:
-            /*
-             * MVC Prefix NAL (NAL type 14).
-             *
-             * Precedes base view slices in MVC bitstreams. Contains the
-             * 3-byte MVC extension header (svc_extension_flag, non_idr_flag,
-             * priority_id, view_id, temporal_id, anchor_pic_flag,
-             * inter_view_flag, reserved_one_bit).
-             *
-             * The prefix NAL doesn't carry slice data itself -- it's
-             * metadata about the following base view slice. We could
-             * extract temporal_id and priority_id for sub-bitstream
-             * extraction, but for basic MVC decoding this is a no-op.
-             */
+            /* MVC prefix NAL (type 14): metadata for the following base
+             * view slice. Not needed for decoding -- no-op. */
             break;
         case H264_NAL_EXTEN_SLICE: {
             /*
-             * MVC Extension Slice (NAL type 20, H.264 Annex G/H).
-             *
-             * This is the dependent view's coded slice. The NAL header
-             * is 4 bytes (1 standard + 3 extension) instead of 1 byte.
-             * After the extension header, the bitstream is a standard
-             * H.264 slice header + slice data.
-             *
-             * Extension header layout (3 bytes = 24 bits):
-             *   svc_extension_flag  (1)  -- 0=MVC, 1=SVC
-             *   non_idr_flag        (1)  -- 0=IDR, 1=non-IDR
-             *   priority_id         (6)  -- sub-bitstream priority
-             *   view_id             (10) -- identifies the view
-             *   temporal_id         (3)  -- temporal scalability layer
-             *   anchor_pic_flag     (1)  -- 1 if anchor (similar to IDR)
-             *   inter_view_flag     (1)  -- 1 if used for inter-view pred
-             *   reserved_one_bit    (1)  -- must be 1
-             *
-             * Strategy: Parse the extension header, extract view_id, then
-             * rewrite nal->type to IDR_SLICE or SLICE. This lets the
-             * standard slice header parsing (ff_h264_queue_decode_slice)
-             * work unchanged -- it doesn't need to know about MVC.
+             * MVC extension slice (NAL type 20, H.264 Annex H).
+             * 4-byte NAL header: 1 standard + 3 extension (svc_ext_flag,
+             * non_idr_flag, priority_id, view_id, temporal_id, flags).
+             * Parse the extension, extract view_id, then rewrite nal->type
+             * to SLICE so standard slice parsing handles it unchanged.
              */
             int non_idr_flag;
 
@@ -898,18 +872,8 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             if (ret < 0)
                 goto end;
 
-            /*
-             * view_ids filtering: skip dependent views not requested.
-             *
-             * Default (nb_view_ids == 0): base view only, skip all
-             * dependent views. Matches HEVC multiview default behavior.
-             *
-             * A single -1: decode and output all views.
-             *
-             * Otherwise: decode only listed view IDs. Base view (0) is
-             * always decoded as reference, but output filtering in
-             * finalize_frame() will skip it if not in the list.
-             */
+            /* view_ids filtering: skip views not requested by the user.
+             * Default (empty): base view only. -1: all views. */
             if (h->nb_view_ids == 0) {
                 /* Default: base view only */
                 break;
@@ -925,14 +889,8 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                     break;
             }
 
-            /*
-             * Frame threading: each worker gets one packet from
-             * ff_thread_get_packet. MVC dep view needs the base view
-             * picture as an inter-view reference, but with separate
-             * packets per view, the dep view worker can't access the
-             * base view decoded in a different worker. Skip dep view
-             * decoding under frame threading for now.
-             */
+            /* MVC dep view needs base view as inter-view ref,
+             * not available with frame threading. */
             if (avctx->active_thread_type & FF_THREAD_FRAME) {
                 av_log(avctx, AV_LOG_DEBUG,
                        "MVC: skipping dep view %d (frame threading active)\n",
@@ -940,18 +898,7 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                 break;
             }
 
-            /*
-             * Interlaced MVC: skip dependent view decoding.
-             *
-             * Interlaced MVC streams have field pairs where the two
-             * fields may have different nal_ref_idc (one reference,
-             * one non-reference). The slice init code rejects this
-             * combination with AVERROR_PATCHWELCOME, causing cascading
-             * errors that lose more frames than we'd decode.
-             *
-             * Skip dep view for interlaced content until the
-             * mixed-reference field pair limitation is resolved.
-             */
+            /* Interlaced MVC: mixed-ref field pairs hit PATCHWELCOME. */
             if (h->ps.sps && !h->ps.sps->frame_mbs_only_flag) {
                 av_log(avctx, AV_LOG_DEBUG,
                        "MVC: skipping dep view %d (interlaced not supported)\n",
@@ -959,68 +906,20 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                 break;
             }
 
-            /*
-             * Rewrite NAL type to regular SLICE.
-             *
-             * MVC extension slices are always rewritten to NAL_SLICE
-             * (never IDR_SLICE), even when non_idr_flag == 0. Reason:
-             * MVC "IDR" slices in the dependent view use inter-view
-             * prediction (P-slice referencing the base view), so they
-             * are NOT all-intra. The slice header parse rejects
-             * non-I slices with nal_type == IDR_SLICE ("A non-intra
-             * slice in an IDR NAL unit").
-             *
-             * The non_idr_flag only means this is an MVC anchor picture
-             * (similar to a random access point), not a standard H.264
-             * IDR. The base view's IDR already handled the DPB reset.
-             */
+            /* Rewrite to SLICE (not IDR_SLICE): MVC dep view "IDR" uses
+             * inter-view prediction (P-slice), which would be rejected
+             * as "non-intra slice in IDR NAL". idr_pic_flag handles
+             * the IDR semantics separately. */
             nal->type = H264_NAL_SLICE;
             h->nal_unit_type = nal->type;
 
             h->idr_pic_flag = !non_idr_flag;
 
-            if (!non_idr_flag) {
-                /*
-                 * MVC anchor picture (non_idr_flag == 0).
-                 * Mark as recovery point for error recovery.
-                 * Don't call idr() -- the base view's IDR already
-                 * cleared the DPB.
-                 */
+            if (!non_idr_flag)
                 h->has_recovery_point = 1;
-            }
 
             h->has_slice = 1;
-
-            if ((err = ff_h264_queue_decode_slice(h, nal))) {
-                H264SliceContext *sl = h->slice_ctx + h->nb_slice_ctx_queued;
-                sl->ref_count[0] = sl->ref_count[1] = 0;
-                break;
-            }
-
-            if (h->current_slice == 1) {
-                if (avctx->active_thread_type & FF_THREAD_FRAME &&
-                    i >= nals_needed && !h->setup_finished && h->cur_pic_ptr) {
-                    ff_thread_finish_setup(avctx);
-                    h->setup_finished = 1;
-                }
-
-                if (h->avctx->hwaccel &&
-                    (ret = FF_HW_CALL(h->avctx, start_frame, buf_ref,
-                                      buf, buf_size)) < 0)
-                    goto end;
-            }
-
-            max_slice_ctx = avctx->hwaccel ? 1 : h->nb_slice_ctx;
-            if (h->nb_slice_ctx_queued == max_slice_ctx) {
-                if (h->avctx->hwaccel) {
-                    ret = FF_HW_CALL(avctx, decode_slice, nal->raw_data, nal->raw_size);
-                    h->nb_slice_ctx_queued = 0;
-                } else
-                    ret = ff_h264_execute_decode_slices(h);
-                if (ret < 0 && (h->avctx->err_recognition & AV_EF_EXPLODE))
-                    goto end;
-            }
-            break;
+            goto slice_common;
         }
         case H264_NAL_AUD:
         case H264_NAL_END_SEQUENCE:
@@ -1186,14 +1085,7 @@ static int output_frame(H264Context *h, AVFrame *dst, H264Picture *srcp)
     if (!(h->avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN))
         av_frame_remove_side_data(dst, AV_FRAME_DATA_FILM_GRAIN_PARAMS);
 
-    /*
-     * MVC: Attach AV_FRAME_DATA_VIEW_ID side data.
-     *
-     * Added for all frames when MVC is active (even base view with
-     * view_id=0), so the caller can distinguish views. Also add
-     * AVStereo3D side data with FRAMESEQUENCE type -- MVC base view
-     * is conventionally left, dependent view is right.
-     */
+    /* MVC: attach view_id and stereo3d side data */
     if (h->mvc_active) {
         AVFrameSideData *sd = av_frame_side_data_new(
             &dst->side_data, &dst->nb_side_data,

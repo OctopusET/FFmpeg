@@ -165,22 +165,7 @@ typedef struct H264Picture {
 
     int gray;
 
-    /**
-     * MVC view identifier (H.264 Annex H).
-     *
-     * 0 = base view (standard AVC). >0 = dependent view (MVC extension).
-     * Extracted from the 3-byte NAL extension header of NAL type 20
-     * (EXTEN_SLICE). Set in ff_h264_queue_decode_slice() when the picture
-     * is allocated (h264_slice.c).
-     *
-     * Used by reference management (h264_refs.c) to filter the shared DPB
-     * into per-view reference lists. Both views in the same access unit
-     * share the same frame_num but have different view_ids.
-     *
-     * For non-MVC streams, this is always 0 (zero-initialized by memset
-     * in ff_h264_unref_picture).
-     */
-    int view_id;
+    int view_id;            ///< MVC view identifier (0=base, >0=dependent)
 } H264Picture;
 
 typedef struct H264Ref {
@@ -483,23 +468,9 @@ typedef struct H264Context {
     H264POCContext poc;
 
     /**
-     * POC context for MVC dependent view (view_id > 0).
-     *
-     * In MVC, each view maintains independent POC state (poc_lsb,
-     * poc_msb, delta_poc_bottom, prev_poc_msb/lsb, etc.) because
-     * each view's slice headers carry their own POC parameters.
-     * They share the same frame_num within an access unit, but
-     * the prev_* tracking must be per-view to avoid the dependent
-     * view overwriting the base view's POC state.
-     *
-     * h->poc is always the base view (view_id == 0).
-     * h->dep_view_poc is for the first dependent view (view_id > 0).
-     *
-     * Code in h264_field_start, ff_h264_field_end, and MMCO_RESET
-     * selects the correct context via:
+     * Per-view POC context for MVC dependent view (view_id > 0).
+     * Each view tracks POC state independently. Selected via:
      *   H264POCContext *poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
-     *
-     * For non-MVC streams, dep_view_poc is never used.
      */
     H264POCContext dep_view_poc;
 
@@ -618,95 +589,24 @@ typedef struct H264Context {
     int noref_gray;
     int skip_gray;
 
-    /**
-     * MVC: view_id of the NAL currently being decoded.
-     *
-     * Set in decode_nal_units() (h264dec.c):
-     * - To 0 for NAL types SLICE/IDR_SLICE (base view).
-     * - To the extension header's view_id for NAL type EXTEN_SLICE.
-     *
-     * Propagated to H264Picture.view_id when a new picture is allocated.
-     * Used throughout h264_refs.c to filter references by view.
-     *
-     * For non-MVC streams, always 0.
-     */
-    int cur_view_id;
+    int cur_view_id;        ///< MVC view_id of current NAL (0=base)
+    int idr_pic_flag;       ///< IdrPicFlag: nal_type==5 or MVC !non_idr_flag
+
+    AVContainerFifo *output_fifo;   ///< multi-frame output FIFO (MVC multiview)
+    int mvc_active;                 ///< 1 when NAL type 20 has been seen
 
     /**
-     * IdrPicFlag for MVC (H.264 Annex H, H.7.4.1.1).
-     *
-     * For NAL type 20 (EXTEN_SLICE), IdrPicFlag = !non_idr_flag.
-     * When set, the slice header contains idr_pic_id and POC is
-     * reset, even though nal_unit_type != 5 and the slice may be
-     * a P-slice (inter-view predicted).
-     *
-     * For regular NAL types 1-5, this equals (nal_unit_type == 5).
-     * Set in decode_nal_units() before calling queue_decode_slice().
-     */
-    int idr_pic_flag;
-
-    /**
-     * Output FIFO for multi-frame output (MVC multiview).
-     *
-     * With MVC, a single access unit produces one frame per view
-     * (base + dependent). The receive_frame API returns one frame at
-     * a time, so decoded frames are pushed here and drained one by one.
-     *
-     * For non-MVC streams the FIFO contains exactly one frame per
-     * decode call, so behavior is equivalent to the old decode_frame API.
-     */
-    AVContainerFifo *output_fifo;
-
-    /**
-     * Set to 1 when MVC extension slices (NAL type 20) have been seen.
-     * Used to decide whether to add AV_FRAME_DATA_VIEW_ID side data
-     * and populate view_ids_available.
-     */
-    int mvc_active;
-
-    /**
-     * Deferred dependent view packets for MVC packet reordering.
-     *
-     * In MPEG-TS with merged MVC PIDs, the dependent view PES often arrives
-     * before the base view PES for the same access unit. Additionally, the
-     * parser may split a multi-slice dep view picture into several packets,
-     * all arriving before the base view packet.
-     *
-     * h264_receive_frame() accumulates all consecutive dep-view-only packets
-     * here. When a base view packet arrives, it is decoded first, then all
-     * accumulated dep view packets are drained. This ensures the base view
-     * picture is in short_ref[] before any dep view slice needs it as an
-     * inter-view reference.
-     *
-     * Uses PacketList from packet_internal.h (linked list of AVPackets).
+     * Deferred dep view packets for MVC reordering.
+     * Dep view PES may arrive before base view; accumulated here and
+     * drained after the base view packet is decoded.
      */
     PacketList mvc_pending_pkts;
 
-    /**
-     * User-requested view IDs to decode and output (AVOption array).
-     *
-     * Empty (nb_view_ids == 0): decode base view only (default).
-     * Single element -1: decode and output all views.
-     * Otherwise: decode and output only the listed view IDs.
-     *
-     * Follows the HEVC multiview decoder pattern.
-     */
-    int *view_ids;
+    int *view_ids;                  ///< user-requested view IDs (AVOption, -1=all)
     unsigned nb_view_ids;
-
-    /**
-     * Available view IDs in the stream (exported AVOption array).
-     * Populated when MVC extension slices are detected.
-     */
-    unsigned *view_ids_available;
+    unsigned *view_ids_available;   ///< detected view IDs (exported AVOption)
     unsigned nb_view_ids_available;
-
-    /**
-     * View positions for view_ids_available (exported AVOption array).
-     * Maps each view_id to AV_STEREO3D_VIEW_LEFT/RIGHT.
-     * MVC convention: view_id 0 = left, view_id > 0 = right.
-     */
-    unsigned *view_pos_available;
+    unsigned *view_pos_available;   ///< view positions for view_ids_available
     unsigned nb_view_pos_available;
 } H264Context;
 

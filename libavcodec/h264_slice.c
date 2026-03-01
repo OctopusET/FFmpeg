@@ -539,9 +539,6 @@ static int h264_frame_start(H264Context *h)
         return ret;
 
     h->cur_pic_ptr = pic;
-    /* MVC: Tag the newly allocated picture with the current view_id.
-     * This is how we track which view each picture in the DPB belongs to.
-     * For non-MVC streams, cur_view_id is always 0. */
     pic->view_id = h->cur_view_id;
     ff_h264_unref_picture(&h->cur_pic);
     if (CONFIG_ERROR_RESILIENCE) {
@@ -1410,16 +1407,7 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
 {
     int i;
     const SPS *sps;
-    /*
-     * Per-view POC context pointer (MVC, H.264 Annex H).
-     *
-     * Each view maintains independent POC state because each view's
-     * slice headers carry their own poc_lsb / delta_poc parameters,
-     * and the prev_poc_msb/lsb tracking must not be cross-contaminated.
-     *
-     * For base view (cur_view_id == 0) this points to h->poc (unchanged).
-     * For the dependent view it points to h->dep_view_poc.
-     */
+    /* MVC: select per-view POC context */
     H264POCContext *const poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
 
     int last_pic_structure, last_pic_droppable, ret;
@@ -1662,12 +1650,7 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
     h->nb_mmco = sl->nb_mmco;
     h->explicit_ref_marking = sl->explicit_ref_marking;
 
-    /*
-     * picture_idr controls DPB clearing in execute_ref_pic_marking().
-     * For MVC dependent views, the base view IDR already cleared the DPB.
-     * Setting picture_idr for a dep view anchor would incorrectly remove
-     * the base view picture that the dep view needs for inter-view prediction.
-     */
+    /* MVC: don't clear DPB for dep view anchors -- base view already did */
     h->picture_idr = h->idr_pic_flag && !h->cur_view_id;
 
     if (h->sei.recovery_point.recovery_frame_cnt >= 0) {
@@ -2140,25 +2123,9 @@ int ff_h264_queue_decode_slice(H264Context *h, const H2645NAL *nal)
             } else if (h->cur_pic_ptr && !FIELD_PICTURE(h) && !h->first_field &&
                        (h->idr_pic_flag ||
                         h->cur_pic_ptr->view_id != h->cur_view_id)) {
-                /*
-                 * Two cases reach here:
-                 * 1) Broken frame packetizing: an IDR slice starts a new
-                 *    picture while a non-IDR was in progress.
-                 * 2) MVC view transition: the current picture belongs to a
-                 *    different view than the incoming NAL. This is normal
-                 *    for MVC -- each access unit has back-to-back pictures
-                 *    from different views (e.g., dep IDR followed by base P).
-                 *    Without this, field_end would never be called for the
-                 *    current picture, so it would never be added to short_ref.
-                 */
+                /* Broken frame packetizing or MVC view transition */
                 if (h->cur_pic_ptr->view_id == h->cur_view_id)
                     av_log(h->avctx, AV_LOG_WARNING, "Broken frame packetizing\n");
-                /*
-                 * With frame threading, the thread update function runs
-                 * execute_ref_pic_marking. Passing in_setup=1 here would
-                 * cause it to run twice, triggering "illegal short term
-                 * buffer state". Only run it here for non-frame-threaded.
-                 */
                 ret = ff_h264_field_end(h, h->slice_ctx,
                                         !(h->avctx->active_thread_type & FF_THREAD_FRAME));
                 ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX, 0);

@@ -132,35 +132,14 @@ static int mismatches_ref(const H264Context *h, const H264Picture *pic)
 
 /**
  * Initialize default reference picture lists for the current slice.
- *
- * H.264 spec 8.2.4.2: Initialization process for reference picture lists.
- * MVC spec H.8.4: Modified initialization for multiview.
- *
- * For MVC, the DPB (short_ref[] and long_ref[]) contains pictures from ALL
- * views. Each view's reference list must only contain pictures from its own
- * view (temporal references) plus inter-view references. We filter the
- * shared DPB into per-view arrays before building the default lists.
- *
- * For non-MVC streams, all view_ids are 0 (H264Picture is zero-initialized),
- * so the filtering is a no-op and the arrays are identical copies.
+ * For MVC, filters the shared DPB by view_id before building lists,
+ * and appends inter-view references for dependent view slices.
  */
 static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
 {
     int len;
 
-    /*
-     * MVC per-view DPB filtering (H.264 Annex H, H.8.4).
-     *
-     * The shared DPB may contain e.g.:
-     *   short_ref[0]: view_id=0, fn=5  (base view)
-     *   short_ref[1]: view_id=1, fn=5  (dependent view)
-     *   short_ref[2]: view_id=0, fn=4  (base view)
-     *   short_ref[3]: view_id=1, fn=4  (dependent view)
-     *
-     * If cur_view_id=1, view_short_ref[] will contain only [1] and [3].
-     * The base view pictures are excluded from temporal reference lists
-     * but may be added back as inter-view references (see below).
-     */
+    /* MVC: filter shared DPB into per-view arrays (H.264 Annex H, H.8.4) */
     H264Picture *view_short_ref[32];
     int view_short_count = 0;
     H264Picture *view_long_ref[32] = { NULL };
@@ -223,51 +202,17 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
     }
 
     /*
-     * MVC inter-view reference picture (H.264 Annex H, H.8.4).
-     *
-     * For a dependent view slice, we need to add the base view's picture
-     * from the same access unit as an additional reference. This is the
-     * "inter-view prediction" mechanism that allows a dependent view to
-     * reference the already-decoded base view instead of encoding
-     * everything independently.
-     *
-     * Inter-view refs are appended AFTER all temporal refs in the default
-     * reference list (spec H.8.4). The slice's ref_pic_list_modification
-     * (idc=4) can then move it to any position.
-     *
-     * Lookup key: frame_num (NOT POC).
-     * Both views in the same access unit share the same frame_num
-     * (it comes from the slice header, which is the same for both views
-     * in the same AU). However, POC differs between views because the
-     * shared H264POCContext produces different values for each view's
-     * poc_lsb. So frame_num is the reliable identifier for "same AU".
-     *
-     * Normally, h264_receive_frame() reorders packets so that the base
-     * view is decoded before the dependent view (fixing MPEG-TS PES
-     * ordering). If the base view picture is still not found (e.g. due
-     * to packet loss), the inter-view ref is simply not added and
-     * error concealment handles the missing reference.
+     * MVC inter-view reference (H.264 Annex H, H.8.4).
+     * For dependent view slices, append the base view picture from the
+     * same access unit (matched by frame_num) as an additional ref.
      */
     if (h->cur_view_id) {
         H264Picture *iv_ref = NULL;
         int cur_frame_num = h->cur_pic_ptr->frame_num;
 
-        /*
-         * Search the DPB for the base view (view_id=0) picture with
-         * matching frame_num.
-         *
-         * We search the full DPB rather than short_ref[] because
-         * non-reference frames (droppable, nal_ref_idc==0) are never
-         * added to short_ref[] by execute_ref_pic_marking. However,
-         * these frames ARE still in the DPB with DELAYED_PIC_REF set
-         * by h264_select_output_frame, so they haven't been released.
-         *
-         * In MVC, inter-view references are a separate category from
-         * temporal references (H.264 Annex H, H.8.2.1). The base
-         * view picture is needed for inter-view prediction regardless
-         * of whether it is marked as "used for reference" in the
-         * temporal sense.
-         */
+        /* Search full DPB (not just short_ref) for base view with
+         * matching frame_num -- droppable frames may not be in short_ref
+         * but are still in the DPB. */
         for (int i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
             if (h->DPB[i].f->buf[0] &&
                 h->DPB[i].view_id == 0 &&
@@ -277,11 +222,7 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
             }
         }
         if (iv_ref && !mismatches_ref(h, iv_ref)) {
-            /* Set pic_id to frame_num for consistency with the ref list
-             * modification process (idc=4 uses pic_id). */
             iv_ref->pic_id = iv_ref->frame_num;
-            /* Append to all active reference lists (list0, and list1
-             * for B-slices). Find the first empty slot. */
             for (int list = 0; list < 1 + (sl->slice_type_nos == AV_PICTURE_TYPE_B); list++) {
                 int pos;
                 for (pos = 0; pos < sl->ref_count[list]; pos++) {
@@ -290,15 +231,8 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
                 }
                 if (pos < FF_ARRAY_ELEMS(sl->ref_list[0])) {
                     ref_from_h264pic(&sl->ref_list[list][pos], iv_ref);
-                    /*
-                     * Inter-view references are valid regardless of the
-                     * base view's temporal reference status (H.264 Annex H,
-                     * H.8.2.1). A non-reference base view frame (droppable,
-                     * nal_ref_idc==0) has reference=0 or DELAYED_PIC_REF,
-                     * which would fail the ref list validation check
-                     * (reference & 3) != 3. Override to PICT_FRAME so the
-                     * inter-view ref passes validation.
-                     */
+                    /* Override reference for droppable base view frames
+                     * to pass ref list validation. */
                     sl->ref_list[list][pos].reference = PICT_FRAME;
                 }
             }
@@ -491,23 +425,8 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                 break;
             }
             case 4: {
-                /*
-                 * MVC inter-view reference picture list modification.
-                 * (H.264 Annex H, modification_of_pic_nums_idc == 4)
-                 *
-                 * The slice header contains abs_diff_view_idx_minus1 (parsed
-                 * as 'val' by the parser). For stereo MVC (2 views), this is
-                 * always 0, meaning "the first other view" = the base view.
-                 *
-                 * We find the inter-view reference by searching for a picture
-                 * with a DIFFERENT view_id but the SAME frame_num (= same
-                 * access unit). This picture is then placed at position
-                 * 'index' in the reference list, shifting others down.
-                 *
-                 * This allows the encoder to control exactly where the
-                 * inter-view reference appears in the ref list, enabling
-                 * weighted prediction or specific reference ordering.
-                 */
+                /* MVC inter-view ref list modification (idc=4, Annex H).
+                 * Find picture with different view_id, same frame_num. */
                 int cur_frame_num = h->cur_pic_ptr->frame_num;
                 pic_structure = h->picture_structure;
                 for (i = h->short_ref_count - 1; i >= 0; i--) {
@@ -522,11 +441,7 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                 break;
             }
             case 5:
-                /*
-                 * MVC inter-view long-term reference modification.
-                 * (modification_of_pic_nums_idc == 5)
-                 * Not commonly used in stereo MVC. Treat as no-op.
-                 */
+                /* MVC inter-view long-term ref modification (idc=5). */
                 i = -1;
                 break;
             default:
@@ -673,11 +588,7 @@ static H264Picture *find_short(H264Context *h, int frame_num, int *idx)
         H264Picture *pic = h->short_ref[i];
         if (h->avctx->debug & FF_DEBUG_MMCO)
             av_log(h->avctx, AV_LOG_DEBUG, "%d %d %p\n", i, pic->frame_num, pic);
-        /*
-         * MVC: Match both frame_num and view_id. Two views in the
-         * same access unit share the same frame_num, so matching
-         * frame_num alone could return the wrong view's picture.
-         */
+        /* MVC: match both frame_num and view_id */
         if (pic->frame_num == frame_num &&
             pic->view_id == h->cur_view_id) {
             *idx = i;
@@ -765,19 +676,8 @@ void ff_h264_remove_all_refs(H264Context *h)
 }
 
 /**
- * Generate sliding window memory management control operations.
- *
- * H.264 spec 8.2.5.3: Sliding window decoded reference picture marking.
- * When no explicit MMCO is signaled, the oldest short-term ref is removed
- * when the DPB is full (short + long >= max_num_ref_frames).
- *
- * MVC modification: Each view has its own "virtual DPB partition". The
- * fullness check and removal operate on same-view references only. This
- * prevents one view's references from evicting the other view's references.
- *
- * The oldest same-view index is tracked as we scan. Since short_ref[] is
- * ordered newest-first (index 0 = newest), the highest matching index
- * is the oldest same-view picture.
+ * Generate sliding window MMCO (H.264 8.2.5.3).
+ * MVC: counts and evicts only same-view references.
  */
 static void generate_sliding_window_mmcos(H264Context *h)
 {
@@ -787,8 +687,7 @@ static void generate_sliding_window_mmcos(H264Context *h)
     int view_long_count = 0;
     int oldest_view_idx = -1;
 
-    /* Count only same-view references for the sliding window check.
-     * For non-MVC streams (all view_ids == 0), this counts everything. */
+    /* Count same-view references only */
     for (int i = 0; i < h->short_ref_count; i++) {
         if (h->short_ref[i]->view_id == h->cur_view_id) {
             view_short_count++;
@@ -962,21 +861,8 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
                                            "(first field is long term)\n");
             err = AVERROR_INVALIDDATA;
         } else {
-            /*
-             * Insert current picture into short_ref[].
-             *
-             * MVC complication: In the shared DPB, both views in the same
-             * access unit have the same frame_num. The standard code does
-             * remove_short(frame_num) which would remove ANY picture with
-             * that frame_num -- potentially the other view's picture.
-             *
-             * Fix: Only remove a picture if BOTH frame_num AND view_id
-             * match. This allows two pictures with the same frame_num
-             * (one per view) to coexist in short_ref[].
-             *
-             * For non-MVC streams this is equivalent to the original logic
-             * since all view_ids are 0.
-             */
+            /* Insert into short_ref. MVC: match both frame_num and view_id
+             * to avoid removing the other view's picture. */
             H264Picture *pic = NULL;
             for (int j = 0; j < h->short_ref_count; j++) {
                 if (h->short_ref[j]->frame_num == h->cur_pic_ptr->frame_num &&
@@ -988,14 +874,8 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
                 }
             }
             if (pic) {
-                /*
-                 * MVC: the parser may split dep view NALs into a
-                 * separate packet AND also combine some into the base
-                 * view packet. The accumulate-and-drain mechanism in
-                 * h264_receive_frame then decodes both, producing a
-                 * duplicate short_ref entry. The old entry was already
-                 * removed above; the new one replaces it. Not an error.
-                 */
+                /* MVC: accumulate-and-drain may produce a duplicate
+                 * short_ref entry. Not an error. */
                 if (!h->mvc_active) {
                     av_log(h->avctx, AV_LOG_ERROR,
                            "illegal short term buffer state detected\n");
@@ -1014,18 +894,7 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
     }
 
     {
-        /*
-         * DPB overflow check.
-         *
-         * MVC: Each view's per-view ref count must not exceed
-         * max_num_ref_frames (from SPS). We count only same-view
-         * references. Without this, one view's refs could push the
-         * total count over the limit, causing the other view's refs
-         * to be incorrectly removed.
-         *
-         * For non-MVC, view_short == short_ref_count and
-         * view_long == long_ref_count (all view_ids are 0).
-         */
+        /* DPB overflow check (per-view for MVC). */
         int view_short = 0, view_long = 0;
         for (int i = 0; i < h->short_ref_count; i++)
             if (h->short_ref[i]->view_id == h->cur_view_id)
