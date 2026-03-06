@@ -1491,13 +1491,27 @@ get_packet:
         goto get_packet;
     }
 
-    ret = h264_decode_packet(h, avpkt);
-    if (ret < 0)
-        return ret;
+    /* MVC: drain accumulated dep-view packets BEFORE the next base view
+     * packet. This ensures dep B-frames from the current GOP are decoded
+     * while their base view references are still in the DPB. */
+    if (h->mvc_active) {
+        if (h->cur_pic_ptr && !h->cur_pic_ptr->view_id) {
+            h->mvc_base_pic = h->cur_pic_ptr;
+            h->mvc_base_pic->reference |= MVC_IV_REF;
+        }
 
-    /* Drain all accumulated dep-view packets now that the base view
-     * picture is in short_ref[]. */
-    ret = h264_drain_mvc_pending(h);
+        ret = h264_drain_mvc_pending(h);
+
+        if (h->mvc_base_pic) {
+            h->mvc_base_pic->reference &= ~MVC_IV_REF;
+            h->mvc_base_pic = NULL;
+        }
+
+        if (ret < 0)
+            return ret;
+    }
+
+    ret = h264_decode_packet(h, avpkt);
     if (ret < 0)
         return ret;
 

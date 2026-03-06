@@ -149,6 +149,11 @@ typedef struct H264Picture {
  * when the picture is held for delayed output.
  */
 #define DELAYED_PIC_REF  (1 << 2)
+/**
+ * H264Picture.reference has this flag set while the picture is needed
+ * as an inter-view reference for MVC dependent view decoding.
+ */
+#define MVC_IV_REF       (1 << 3)
     int reference;
     int recovered;          ///< picture at IDR or recovery point + recovery count
     int invalid_gap;
@@ -594,6 +599,7 @@ typedef struct H264Context {
 
     AVContainerFifo *output_fifo;   ///< multi-frame output FIFO (MVC multiview)
     int mvc_active;                 ///< 1 when NAL type 20 has been seen
+    H264Picture *mvc_base_pic;      ///< base view picture for inter-view ref
 
     /**
      * Deferred dep view packets for MVC reordering.

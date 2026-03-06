@@ -205,20 +205,25 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
      * MVC inter-view reference (H.264 Annex H, H.8.4).
      * For dependent view slices, append the base view picture from the
      * same access unit (matched by frame_num) as an additional ref.
+     * Use mvc_base_pic (saved in receive_frame with MVC_IV_REF
+     * protection) first, then fall back to DPB search.
      */
     if (h->cur_view_id) {
         H264Picture *iv_ref = NULL;
         int cur_frame_num = h->cur_pic_ptr->frame_num;
 
-        /* Search full DPB (not just short_ref) for base view with
-         * matching frame_num -- droppable frames may not be in short_ref
-         * but are still in the DPB. */
-        for (int i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
-            if (h->DPB[i].f->buf[0] &&
-                h->DPB[i].view_id == 0 &&
-                h->DPB[i].frame_num == cur_frame_num) {
-                iv_ref = &h->DPB[i];
-                break;
+        if (h->mvc_base_pic && h->mvc_base_pic->f->buf[0] &&
+            h->mvc_base_pic->frame_num == cur_frame_num)
+            iv_ref = h->mvc_base_pic;
+
+        if (!iv_ref) {
+            for (int i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
+                if (h->DPB[i].f->buf[0] &&
+                    h->DPB[i].view_id == 0 &&
+                    h->DPB[i].frame_num == cur_frame_num) {
+                    iv_ref = &h->DPB[i];
+                    break;
+                }
             }
         }
         if (iv_ref && !mismatches_ref(h, iv_ref)) {
@@ -440,12 +445,36 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                     pic_id = ref->pic_id;
                 break;
             }
-            case 5:
-                /* MVC inter-view long-term ref modification (idc=5), not supported. */
-                av_log(h->avctx, AV_LOG_WARNING,
-                       "MVC inter-view long-term ref modification not supported\n");
+            case 5: {
+                /* MVC inter-view long-term ref modification (idc=5, Annex H).
+                 * Find inter-view picture with different view_id, same
+                 * frame_num. Use mvc_base_pic (protected by MVC_IV_REF)
+                 * first, then fall back to DPB search. */
+                int cur_frame_num = h->cur_pic_ptr->frame_num;
                 i = -1;
+
+                if (h->mvc_base_pic && h->mvc_base_pic->f->buf[0] &&
+                    h->mvc_base_pic->view_id != h->cur_view_id &&
+                    h->mvc_base_pic->frame_num == cur_frame_num) {
+                    ref = h->mvc_base_pic;
+                    pic_id = ref->pic_id;
+                    i = 0;
+                }
+
+                if (i < 0) {
+                    for (int j = 0; j < H264_MAX_PICTURE_COUNT; j++) {
+                        if (h->DPB[j].f->buf[0] &&
+                            h->DPB[j].view_id != h->cur_view_id &&
+                            h->DPB[j].frame_num == cur_frame_num) {
+                            ref = &h->DPB[j];
+                            pic_id = ref->pic_id;
+                            i = 0;
+                            break;
+                        }
+                    }
+                }
                 break;
+            }
             default:
                 av_assert0(0);
             }
@@ -453,8 +482,19 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
             if (i < 0 || mismatches_ref(h, ref)) {
                 av_log(h->avctx, AV_LOG_ERROR,
                        i < 0 ? "reference picture missing during reorder\n" :
-                               "mismatching reference\n"
-                      );
+                               "mismatching reference\n");
+                if (h->cur_view_id) {
+                    av_log(h->avctx, AV_LOG_DEBUG,
+                           "  idc=%d view=%d cur_fn=%d pic_id=%d\n",
+                           modification_of_pic_nums_idc, h->cur_view_id,
+                           h->cur_pic_ptr->frame_num, pic_id);
+                    for (int k = 0; k < h->short_ref_count; k++)
+                        av_log(h->avctx, AV_LOG_DEBUG,
+                               "  short_ref[%d]: view=%d fn=%d ref=%d\n",
+                               k, h->short_ref[k]->view_id,
+                               h->short_ref[k]->frame_num,
+                               h->short_ref[k]->reference);
+                }
                 if (h->avctx->err_recognition & AV_EF_EXPLODE) {
                     return AVERROR_INVALIDDATA;
                 }
@@ -478,13 +518,16 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
     }
     for (int list = 0; list < sl->list_count; list++) {
         for (int index = 0; index < sl->ref_count[list]; index++) {
+            int ref = sl->ref_list[list][index].reference;
             if (   !sl->ref_list[list][index].parent
-                || (!FIELD_PICTURE(h) && (sl->ref_list[list][index].reference&3) != 3)) {
+                || (!FIELD_PICTURE(h) && !(ref & MVC_IV_REF) && (ref & 3) != 3)) {
                 if (h->avctx->err_recognition & AV_EF_EXPLODE) {
                     av_log(h->avctx, AV_LOG_ERROR, "Missing reference picture\n");
                     return AVERROR_INVALIDDATA;
                 }
-                av_log(h->avctx, AV_LOG_ERROR, "Missing reference picture, default is %d\n", h->default_ref[list].poc);
+                av_log(h->avctx, AV_LOG_ERROR,
+                       "Missing reference picture, default is %d\n",
+                       h->default_ref[list].poc);
 
                 for (int i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++)
                     h->last_pocs[i] = INT_MIN;
