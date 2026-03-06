@@ -432,6 +432,24 @@ static av_cold int h264_decode_init(AVCodecContext *avctx)
         h->avctx->has_b_frames = h->ps.sps->num_reorder_frames;
     }
 
+    /* MVC multiview requires inter-view references within a single DPB,
+     * which is incompatible with frame threading. Detect MVC from
+     * extradata (profiles 118=Multiview High, 128=Stereo High) and
+     * fall back to slice threading. */
+    for (int i = 0; i < MAX_SPS_COUNT; i++) {
+        if (h->ps.sps_list[i] &&
+            (h->ps.sps_list[i]->profile_idc == 118 ||
+             h->ps.sps_list[i]->profile_idc == 128)) {
+            h->mvc_active = 1;
+            if (avctx->active_thread_type & FF_THREAD_FRAME) {
+                av_log(avctx, AV_LOG_INFO,
+                       "MVC multiview detected, disabling frame threading\n");
+                avctx->active_thread_type &= ~FF_THREAD_FRAME;
+            }
+            break;
+        }
+    }
+
     ff_h264_flush_change(h);
 
     if (h->enable_er < 0 && (avctx->active_thread_type & FF_THREAD_SLICE))
@@ -454,6 +472,12 @@ static void idr(H264Context *h)
     int i;
     if (h->mvc_active) {
         H264POCContext *poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
+        /* Mark stale dep view transition: base IDR after mid-stream
+         * decoding (prev_frame_num > 0) means old-GOP dep slices may
+         * still arrive and must be skipped.  At stream start (prev=-1
+         * or 0), no stale deps exist. */
+        if (!h->cur_view_id && poc->prev_frame_num > 0)
+            h->mvc_base_idr_decoded = 1;
         ff_h264_remove_view_refs(h, h->cur_view_id);
         poc->prev_frame_num        =
         poc->prev_frame_num_offset = 0;
@@ -499,6 +523,7 @@ void ff_h264_flush_change(H264Context *h)
     h->frame_recovered = 0;
     h->current_slice = 0;
     h->mmco_reset = 1;
+    h->mvc_base_idr_decoded = 0;
 }
 
 static av_cold void h264_decode_flush(AVCodecContext *avctx)
@@ -903,12 +928,16 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             if (!h264_view_requested(h, h->cur_view_id))
                 break;
 
-            /* MVC dep view needs base view as inter-view ref,
-             * not available with frame threading. */
+            /* MVC dep view needs base view in the same DPB. With frame
+             * threading, each worker has a separate DPB so inter-view
+             * prediction is impossible. Skip dep view slices when frame
+             * threading is active. */
             if (avctx->active_thread_type & FF_THREAD_FRAME) {
-                av_log(avctx, AV_LOG_DEBUG,
-                       "MVC: skipping dep view %d (frame threading active)\n",
-                       h->cur_view_id);
+                av_log_once(avctx, AV_LOG_WARNING, AV_LOG_DEBUG,
+                            &h->mvc_frame_thread_warned,
+                            "MVC: frame threading active, skipping dep view %d "
+                            "(use -thread_type slice for both views)\n",
+                            h->cur_view_id);
                 break;
             }
 
@@ -919,6 +948,18 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                        h->cur_view_id);
                 break;
             }
+
+            /* MVC: skip stale dep view slices from the previous GOP.
+             * After a base IDR, dep PES packets from the old GOP may still
+             * arrive (MPEG-TS PES ordering).  Non-anchor dep slices
+             * (non_idr_flag=1) reference pictures that have been cleared
+             * by the IDR and must be skipped.  The dep anchor
+             * (non_idr_flag=0) starts the new dep-view GOP and clears
+             * the flag. */
+            if (h->mvc_base_idr_decoded && non_idr_flag)
+                break;
+            if (!non_idr_flag)
+                h->mvc_base_idr_decoded = 0;
 
             /* Rewrite to SLICE (not IDR_SLICE): MVC dep view "IDR" uses
              * inter-view prediction (P-slice), which would be rejected
@@ -1484,8 +1525,12 @@ get_packet:
         return ret;
 
     /* MVC packet reordering: accumulate dep-view-only packets and decode
-     * them after the base view packet. */
+     * them after the base view packet.
+     * Skip when frame threading is active -- each worker gets one packet,
+     * so the accumulate-and-drain pattern doesn't work. Dep view slices
+     * are skipped by the EXTEN_SLICE handler instead. */
     if (h->mvc_active && !h->is_avc &&
+        !avctx->internal->is_frame_mt &&
         h264_is_dep_view_packet(avpkt->data, avpkt->size)) {
         avpriv_packet_list_put(&h->mvc_pending_pkts, avpkt, NULL, 0);
         goto get_packet;
@@ -1494,7 +1539,7 @@ get_packet:
     /* MVC: drain accumulated dep-view packets BEFORE the next base view
      * packet. This ensures dep B-frames from the current GOP are decoded
      * while their base view references are still in the DPB. */
-    if (h->mvc_active) {
+    if (!avctx->internal->is_frame_mt && h->mvc_active) {
         if (h->cur_pic_ptr && !h->cur_pic_ptr->view_id) {
             h->mvc_base_pic = h->cur_pic_ptr;
             h->mvc_base_pic->reference |= MVC_IV_REF;

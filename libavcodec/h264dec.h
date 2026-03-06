@@ -599,7 +599,9 @@ typedef struct H264Context {
 
     AVContainerFifo *output_fifo;   ///< multi-frame output FIFO (MVC multiview)
     int mvc_active;                 ///< 1 when NAL type 20 has been seen
+    int mvc_frame_thread_warned;    ///< log-once flag for frame thread warning
     H264Picture *mvc_base_pic;      ///< base view picture for inter-view ref
+    int mvc_base_idr_decoded;       ///< base view IDR was decoded; stale dep slices must be skipped
 
     /**
      * Deferred dep view packets for MVC reordering.
