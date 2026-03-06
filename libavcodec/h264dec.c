@@ -312,8 +312,11 @@ static int h264_init_context(AVCodecContext *avctx, H264Context *h)
     h->sei.common.unregistered.x264_build = -1;
 
     h->next_outputed_poc = INT_MIN;
-    for (i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++)
+    h->next_outputed_poc_dep = INT_MIN;
+    for (i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++) {
         h->last_pocs[i] = INT_MIN;
+        h->last_pocs_dep[i] = INT_MIN;
+    }
 
     ff_h264_sei_uninit(&h->sei);
 
@@ -366,6 +369,7 @@ static av_cold int h264_decode_end(AVCodecContext *avctx)
         h264_free_pic(h, &h->DPB[i]);
     }
     memset(h->delayed_pic, 0, sizeof(h->delayed_pic));
+    memset(h->delayed_pic_dep, 0, sizeof(h->delayed_pic_dep));
 
     h->cur_pic_ptr = NULL;
 
@@ -494,8 +498,10 @@ static void idr(H264Context *h)
         h->dep_view_poc.prev_poc_msb          = 1<<16;
         h->dep_view_poc.prev_poc_lsb          = -1;
     }
-    for (i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++)
+    for (i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++) {
         h->last_pocs[i] = INT_MIN;
+        h->last_pocs_dep[i] = INT_MIN;
+    }
 }
 
 /* forget old pics after a seek */
@@ -504,6 +510,7 @@ void ff_h264_flush_change(H264Context *h)
     int i, j;
 
     h->next_outputed_poc = INT_MIN;
+    h->next_outputed_poc_dep = INT_MIN;
     h->prev_interlaced_frame = 1;
     idr(h);
 
@@ -515,6 +522,10 @@ void ff_h264_flush_change(H264Context *h)
             if (h->delayed_pic[i] != h->cur_pic_ptr)
                 h->delayed_pic[j++] = h->delayed_pic[i];
         h->delayed_pic[j] = NULL;
+        for (j=i=0; h->delayed_pic_dep[i]; i++)
+            if (h->delayed_pic_dep[i] != h->cur_pic_ptr)
+                h->delayed_pic_dep[j++] = h->delayed_pic_dep[i];
+        h->delayed_pic_dep[j] = NULL;
     }
     ff_h264_unref_picture(&h->last_pic_for_ec);
 
@@ -536,6 +547,7 @@ static av_cold void h264_decode_flush(AVCodecContext *avctx)
                             av_container_fifo_can_read(h->output_fifo));
     avpriv_packet_list_free(&h->mvc_pending_pkts);
     memset(h->delayed_pic, 0, sizeof(h->delayed_pic));
+    memset(h->delayed_pic_dep, 0, sizeof(h->delayed_pic_dep));
 
     ff_h264_flush_change(h);
     ff_h264_sei_uninit(&h->sei);
@@ -942,14 +954,6 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                 break;
             }
 
-            /* Interlaced MVC: mixed-ref field pairs hit PATCHWELCOME. */
-            if (h->ps.sps && !h->ps.sps->frame_mbs_only_flag) {
-                av_log(avctx, AV_LOG_DEBUG,
-                       "MVC: skipping dep view %d (interlaced not supported)\n",
-                       h->cur_view_id);
-                break;
-            }
-
             /* MVC: skip stale dep view slices from the previous GOP.
              * After a base IDR, dep PES packets from the old GOP may still
              * arrive (MPEG-TS PES ordering).  Non-anchor dep slices
@@ -1280,35 +1284,28 @@ fail:
 }
 
 /**
- * Drain all remaining delayed pictures into the output FIFO.
- *
- * Called on EOF (zero-size packet) or NAL_END_SEQUENCE to flush the
- * reorder buffer. Pictures are output in POC order, lowest first.
- * For MVC, pictures from both views are interleaved by POC.
+ * Drain one delayed picture queue (POC order, lowest first).
  */
-static int h264_flush_delayed_to_fifo(H264Context *h)
+static int h264_flush_delayed_queue(H264Context *h, H264Picture **delayed)
 {
     int ret, i, out_idx;
     H264Picture *out;
 
-    h->cur_pic_ptr = NULL;
-    h->first_field = 0;
-
-    while (h->delayed_pic[0]) {
-        out = h->delayed_pic[0];
+    while (delayed[0]) {
+        out = delayed[0];
         out_idx = 0;
         for (i = 1;
-             h->delayed_pic[i] &&
-             !(h->delayed_pic[i]->f->flags & AV_FRAME_FLAG_KEY) &&
-             !h->delayed_pic[i]->mmco_reset;
+             delayed[i] &&
+             !(delayed[i]->f->flags & AV_FRAME_FLAG_KEY) &&
+             !delayed[i]->mmco_reset;
              i++)
-            if (h->delayed_pic[i]->poc < out->poc) {
-                out     = h->delayed_pic[i];
+            if (delayed[i]->poc < out->poc) {
+                out     = delayed[i];
                 out_idx = i;
             }
 
-        for (i = out_idx; h->delayed_pic[i]; i++)
-            h->delayed_pic[i] = h->delayed_pic[i + 1];
+        for (i = out_idx; delayed[i]; i++)
+            delayed[i] = delayed[i + 1];
 
         if (out) {
             h->frame_recovered |= out->recovered;
@@ -1322,6 +1319,27 @@ static int h264_flush_delayed_to_fifo(H264Context *h)
     }
 
     return 0;
+}
+
+/**
+ * Drain all remaining delayed pictures into the output FIFO.
+ *
+ * Called on EOF (zero-size packet) or NAL_END_SEQUENCE to flush the
+ * reorder buffer. Pictures are output in POC order, lowest first.
+ * For MVC, base and dep view queues are flushed separately.
+ */
+static int h264_flush_delayed_to_fifo(H264Context *h)
+{
+    int ret;
+
+    h->cur_pic_ptr = NULL;
+    h->first_field = 0;
+
+    ret = h264_flush_delayed_queue(h, h->delayed_pic);
+    if (ret < 0)
+        return ret;
+
+    return h264_flush_delayed_queue(h, h->delayed_pic_dep);
 }
 
 /**

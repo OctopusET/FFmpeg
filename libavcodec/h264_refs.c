@@ -236,9 +236,14 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
                 }
                 if (pos < FF_ARRAY_ELEMS(sl->ref_list[0])) {
                     ref_from_h264pic(&sl->ref_list[list][pos], iv_ref);
-                    /* Override reference for droppable base view frames
-                     * to pass ref list validation. */
-                    sl->ref_list[list][pos].reference = PICT_FRAME;
+                    if (FIELD_PICTURE(h)) {
+                        pic_as_field(&sl->ref_list[list][pos],
+                                     h->picture_structure);
+                    } else {
+                        /* Override reference for droppable base view
+                         * frames to pass ref list validation. */
+                        sl->ref_list[list][pos].reference = PICT_FRAME;
+                    }
                 }
             }
         }

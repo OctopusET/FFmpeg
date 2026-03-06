@@ -486,6 +486,10 @@ typedef struct H264Context {
     int last_pocs[H264_MAX_DPB_FRAMES];
     H264Picture *next_output_pic;
     int next_outputed_poc;
+    /** MVC dep view: separate reorder buffer so per-view POC ordering works */
+    H264Picture *delayed_pic_dep[H264_MAX_DPB_FRAMES + 2];
+    int last_pocs_dep[H264_MAX_DPB_FRAMES];
+    int next_outputed_poc_dep;
     int poc_offset;         ///< PicOrderCnt_offset from SMPTE RDD-2006
 
     /**

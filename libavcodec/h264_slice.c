@@ -1307,6 +1307,13 @@ static int h264_select_output_frame(H264Context *h)
     H264Picture *out = h->cur_pic_ptr;
     H264Picture *cur = h->cur_pic_ptr;
     int i, pics, out_of_order, out_idx;
+    /* MVC: use per-view reorder buffer so B-frame POC ordering within
+     * each view is independent.  Without this, mixed-view POCs in
+     * the shared delayed_pic[] cause incorrect out-of-order drops. */
+    int is_dep = cur->view_id && h->mvc_active;
+    H264Picture **delayed = is_dep ? h->delayed_pic_dep : h->delayed_pic;
+    int *last_pocs        = is_dep ? h->last_pocs_dep   : h->last_pocs;
+    int *next_poc         = is_dep ? &h->next_outputed_poc_dep : &h->next_outputed_poc;
 
     cur->mmco_reset = h->mmco_reset;
     h->mmco_reset = 0;
@@ -1317,23 +1324,23 @@ static int h264_select_output_frame(H264Context *h)
     }
 
     for (i = 0; 1; i++) {
-        if(i == H264_MAX_DPB_FRAMES || cur->poc < h->last_pocs[i]){
+        if(i == H264_MAX_DPB_FRAMES || cur->poc < last_pocs[i]){
             if(i)
-                h->last_pocs[i-1] = cur->poc;
+                last_pocs[i-1] = cur->poc;
             break;
         } else if(i) {
-            h->last_pocs[i-1]= h->last_pocs[i];
+            last_pocs[i-1]= last_pocs[i];
         }
     }
     out_of_order = H264_MAX_DPB_FRAMES - i;
     if(   cur->f->pict_type == AV_PICTURE_TYPE_B
-       || (h->last_pocs[H264_MAX_DPB_FRAMES-2] > INT_MIN && h->last_pocs[H264_MAX_DPB_FRAMES-1] - (int64_t)h->last_pocs[H264_MAX_DPB_FRAMES-2] > 2))
+       || (last_pocs[H264_MAX_DPB_FRAMES-2] > INT_MIN && last_pocs[H264_MAX_DPB_FRAMES-1] - (int64_t)last_pocs[H264_MAX_DPB_FRAMES-2] > 2))
         out_of_order = FFMAX(out_of_order, 1);
     if (out_of_order == H264_MAX_DPB_FRAMES) {
-        av_log(h->avctx, AV_LOG_VERBOSE, "Invalid POC %d<%d\n", cur->poc, h->last_pocs[0]);
+        av_log(h->avctx, AV_LOG_VERBOSE, "Invalid POC %d<%d\n", cur->poc, last_pocs[0]);
         for (i = 1; i < H264_MAX_DPB_FRAMES; i++)
-            h->last_pocs[i] = INT_MIN;
-        h->last_pocs[0] = cur->poc;
+            last_pocs[i] = INT_MIN;
+        last_pocs[0] = cur->poc;
         cur->mmco_reset = 1;
     } else if(h->avctx->has_b_frames < out_of_order && !sps->bitstream_restriction_flag){
         int loglevel = h->avctx->frame_num > 1 ? AV_LOG_WARNING : AV_LOG_VERBOSE;
@@ -1342,41 +1349,41 @@ static int h264_select_output_frame(H264Context *h)
     }
 
     pics = 0;
-    while (h->delayed_pic[pics])
+    while (delayed[pics])
         pics++;
 
     av_assert0(pics <= H264_MAX_DPB_FRAMES);
 
-    h->delayed_pic[pics++] = cur;
+    delayed[pics++] = cur;
     if (cur->reference == 0)
         cur->reference = DELAYED_PIC_REF;
 
-    out     = h->delayed_pic[0];
+    out     = delayed[0];
     out_idx = 0;
-    for (i = 1; h->delayed_pic[i] &&
-                !(h->delayed_pic[i]->f->flags & AV_FRAME_FLAG_KEY) &&
-                !h->delayed_pic[i]->mmco_reset;
+    for (i = 1; delayed[i] &&
+                !(delayed[i]->f->flags & AV_FRAME_FLAG_KEY) &&
+                !delayed[i]->mmco_reset;
          i++)
-        if (h->delayed_pic[i]->poc < out->poc) {
-            out     = h->delayed_pic[i];
+        if (delayed[i]->poc < out->poc) {
+            out     = delayed[i];
             out_idx = i;
         }
     if (h->avctx->has_b_frames == 0 &&
-        ((h->delayed_pic[0]->f->flags & AV_FRAME_FLAG_KEY) || h->delayed_pic[0]->mmco_reset))
-        h->next_outputed_poc = INT_MIN;
-    out_of_order = out->poc < h->next_outputed_poc;
+        ((delayed[0]->f->flags & AV_FRAME_FLAG_KEY) || delayed[0]->mmco_reset))
+        *next_poc = INT_MIN;
+    out_of_order = out->poc < *next_poc;
 
     if (out_of_order || pics > h->avctx->has_b_frames) {
         out->reference &= ~DELAYED_PIC_REF;
-        for (i = out_idx; h->delayed_pic[i]; i++)
-            h->delayed_pic[i] = h->delayed_pic[i + 1];
+        for (i = out_idx; delayed[i]; i++)
+            delayed[i] = delayed[i + 1];
     }
     if (!out_of_order && pics > h->avctx->has_b_frames) {
         h->next_output_pic = out;
-        if (out_idx == 0 && h->delayed_pic[0] && ((h->delayed_pic[0]->f->flags & AV_FRAME_FLAG_KEY) || h->delayed_pic[0]->mmco_reset)) {
-            h->next_outputed_poc = INT_MIN;
+        if (out_idx == 0 && delayed[0] && ((delayed[0]->f->flags & AV_FRAME_FLAG_KEY) || delayed[0]->mmco_reset)) {
+            *next_poc = INT_MIN;
         } else
-            h->next_outputed_poc = out->poc;
+            *next_poc = out->poc;
 
         // We have reached an recovery point and all frames after it in
         // display order are "recovered".
