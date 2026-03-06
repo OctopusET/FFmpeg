@@ -657,6 +657,23 @@ static H264Picture *remove_long(H264Context *h, int i, int ref_mask)
     return pic;
 }
 
+void ff_h264_remove_view_refs(H264Context *h, int view_id)
+{
+    for (int i = 0; i < 16; i++) {
+        if (h->long_ref[i] && h->long_ref[i]->view_id == view_id)
+            remove_long(h, i, 0);
+    }
+
+    for (int i = h->short_ref_count - 1; i >= 0; i--) {
+        if (h->short_ref[i]->view_id == view_id) {
+            unreference_pic(h, h->short_ref[i], 0);
+            remove_short_at_index(h, i);
+        }
+    }
+
+    memset(h->default_ref, 0, sizeof(h->default_ref));
+}
+
 void ff_h264_remove_all_refs(H264Context *h)
 {
     for (int i = 0; i < 16; i++)

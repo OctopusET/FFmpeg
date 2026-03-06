@@ -510,7 +510,8 @@ static int h264_frame_start(H264Context *h)
 
     pic->reference              = h->droppable ? 0 : h->picture_structure;
     pic->field_picture          = h->picture_structure != PICT_FRAME;
-    pic->frame_num               = h->poc.frame_num;
+    pic->frame_num               = h->cur_view_id ? h->dep_view_poc.frame_num
+                                                    : h->poc.frame_num;
     /*
      * Zero key_frame here; IDR markings per slice in frame or fields are ORed
      * in later.
@@ -1514,6 +1515,15 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
         }
     }
 
+    /* MVC dep view anchor: reset POC before gap check (base view IDR
+     * resets via idr() in decode_nal_units before reaching here). */
+    if (h->idr_pic_flag && h->cur_view_id && h->mvc_active) {
+        poc->prev_frame_num        =
+        poc->prev_frame_num_offset = 0;
+        poc->prev_poc_msb          = 1<<16;
+        poc->prev_poc_lsb          = -1;
+    }
+
     while (poc->frame_num != poc->prev_frame_num && !h->first_field &&
            poc->frame_num != (poc->prev_frame_num + 1) % (1 << sps->log2_max_frame_num)) {
         const H264Picture *prev = h->short_ref_count ? h->short_ref[0] : NULL;
@@ -1650,8 +1660,12 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
     h->nb_mmco = sl->nb_mmco;
     h->explicit_ref_marking = sl->explicit_ref_marking;
 
-    /* MVC: don't clear DPB for dep view anchors -- base view already did */
-    h->picture_idr = h->idr_pic_flag && !h->cur_view_id;
+    h->picture_idr = h->idr_pic_flag;
+
+    /* MVC dep view anchor: clear this view's refs (base view is cleared
+     * by idr() in decode_nal_units for H264_NAL_IDR_SLICE). */
+    if (h->idr_pic_flag && h->cur_view_id && h->mvc_active)
+        ff_h264_remove_view_refs(h, h->cur_view_id);
 
     if (h->sei.recovery_point.recovery_frame_cnt >= 0) {
         const int sei_recovery_frame_cnt = h->sei.recovery_point.recovery_frame_cnt;

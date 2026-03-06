@@ -626,6 +626,7 @@ int ff_h264_alloc_tables(H264Context *h);
 int ff_h264_decode_ref_pic_list_reordering(H264SliceContext *sl, void *logctx);
 int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl);
 void ff_h264_remove_all_refs(H264Context *h);
+void ff_h264_remove_view_refs(H264Context *h, int view_id);
 
 /**
  * Execute the reference picture marking (memory management control operations).

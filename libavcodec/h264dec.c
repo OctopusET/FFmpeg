@@ -452,16 +452,24 @@ static av_cold int h264_decode_init(AVCodecContext *avctx)
 static void idr(H264Context *h)
 {
     int i;
-    ff_h264_remove_all_refs(h);
-    h->poc.prev_frame_num        =
-    h->poc.prev_frame_num_offset = 0;
-    h->poc.prev_poc_msb          = 1<<16;
-    h->poc.prev_poc_lsb          = -1;
-    /* MVC: reset dependent view POC context too */
-    h->dep_view_poc.prev_frame_num        =
-    h->dep_view_poc.prev_frame_num_offset = 0;
-    h->dep_view_poc.prev_poc_msb          = 1<<16;
-    h->dep_view_poc.prev_poc_lsb          = -1;
+    if (h->mvc_active) {
+        H264POCContext *poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
+        ff_h264_remove_view_refs(h, h->cur_view_id);
+        poc->prev_frame_num        =
+        poc->prev_frame_num_offset = 0;
+        poc->prev_poc_msb          = 1<<16;
+        poc->prev_poc_lsb          = -1;
+    } else {
+        ff_h264_remove_all_refs(h);
+        h->poc.prev_frame_num        =
+        h->poc.prev_frame_num_offset = 0;
+        h->poc.prev_poc_msb          = 1<<16;
+        h->poc.prev_poc_lsb          = -1;
+        h->dep_view_poc.prev_frame_num        =
+        h->dep_view_poc.prev_frame_num_offset = 0;
+        h->dep_view_poc.prev_poc_msb          = 1<<16;
+        h->dep_view_poc.prev_poc_lsb          = -1;
+    }
     for (i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++)
         h->last_pocs[i] = INT_MIN;
 }
@@ -715,6 +723,7 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
         err = 0;
         switch (nal->type) {
         case H264_NAL_IDR_SLICE:
+            h->cur_view_id = 0;
             if ((nal->data[1] & 0xFC) == 0x98) {
                 av_log(h->avctx, AV_LOG_ERROR, "Invalid inter IDR frame\n");
                 h->next_outputed_poc = INT_MIN;
