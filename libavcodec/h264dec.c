@@ -524,6 +524,7 @@ void ff_h264_flush_change(H264Context *h)
     h->current_slice = 0;
     h->mmco_reset = 1;
     h->mvc_base_idr_decoded = 0;
+    h->mvc_base_pic = NULL;
 }
 
 static av_cold void h264_decode_flush(AVCodecContext *avctx)
@@ -676,13 +677,13 @@ static int h264_register_view_id(H264Context *h, int view_id)
             return 0;
 
     ids = av_realloc_array(h->view_ids_available, n + 1, sizeof(*ids));
-    pos = av_realloc_array(h->view_pos_available, n + 1, sizeof(*pos));
-    if (!ids || !pos) {
-        if (ids != h->view_ids_available) av_free(ids);
-        if (pos != h->view_pos_available) av_free(pos);
+    if (!ids)
         return AVERROR(ENOMEM);
-    }
     h->view_ids_available = ids;
+
+    pos = av_realloc_array(h->view_pos_available, n + 1, sizeof(*pos));
+    if (!pos)
+        return AVERROR(ENOMEM);
     h->view_pos_available = pos;
 
     h->view_ids_available[n] = view_id;
