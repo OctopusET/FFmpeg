@@ -1592,11 +1592,24 @@ get_packet:
      * packet. This ensures dep B-frames from the current GOP are decoded
      * while their base view references are still in the DPB.
      *
+     * Save/restore field-tracking state: the base view may be mid-field
+     * (first_field=1 with cur_pic_ptr pointing to the first field's
+     * picture).  The dep drain calls h264_decode_packet which modifies
+     * first_field and cur_pic_ptr as it processes dep view fields.
+     * Without save/restore, the base view's second field would see
+     * first_field=0 and be treated as a new frame instead of the
+     * complementary field, losing one output frame.
+     *
      * MVC_IV_REF: temporarily protect the base view picture from being
      * freed by dep view MMCO or sliding window operations.  Without this,
      * dep view decoding could remove the base picture that dep view slices
      * need for inter-view prediction.  Cleared after draining completes. */
-    if (!avctx->internal->is_frame_mt && h->mvc_active) {
+    if (!avctx->internal->is_frame_mt && h->mvc_pending_pkts.head) {
+        int save_first_field = h->first_field;
+        H264Picture *save_cur_pic = h->cur_pic_ptr;
+        int save_picture_structure = h->picture_structure;
+        int save_droppable = h->droppable;
+
         if (h->cur_pic_ptr && !h->cur_pic_ptr->view_id) {
             h->mvc_base_pic = h->cur_pic_ptr;
             h->mvc_base_pic->reference |= MVC_IV_REF;
@@ -1608,6 +1621,11 @@ get_packet:
             h->mvc_base_pic->reference &= ~MVC_IV_REF;
             h->mvc_base_pic = NULL;
         }
+
+        h->first_field = save_first_field;
+        h->cur_pic_ptr = save_cur_pic;
+        h->picture_structure = save_picture_structure;
+        h->droppable = save_droppable;
 
         if (ret < 0)
             return ret;
