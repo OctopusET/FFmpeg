@@ -456,6 +456,7 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                  * frame_num. Use mvc_base_pic (protected by MVC_IV_REF)
                  * first, then fall back to DPB search. */
                 int cur_frame_num = h->cur_pic_ptr->frame_num;
+                pic_structure = h->picture_structure;
                 i = -1;
 
                 if (h->mvc_base_pic && h->mvc_base_pic->f->buf[0] &&
@@ -620,6 +621,12 @@ static inline int unreference_pic(H264Context *h, H264Picture *pic, int refmask)
                 pic->reference = DELAYED_PIC_REF;
                 break;
             }
+        if (!pic->reference)
+            for (int i = 0; h->delayed_pic_dep[i]; i++)
+                if(pic == h->delayed_pic_dep[i]){
+                    pic->reference = DELAYED_PIC_REF;
+                    break;
+                }
         return 1;
     }
 }
@@ -895,16 +902,33 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
             break;
         case MMCO_RESET: {
             H264POCContext *const poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
-            while (h->short_ref_count) {
-                remove_short(h, h->short_ref[0]->frame_num, 0);
+            /* MVC: only remove same-view refs.  remove_short() uses
+             * find_short() which filters by cur_view_id -- iterating
+             * with h->short_ref_count would infinite-loop if cross-view
+             * entries remain.  Walk backwards so index stays valid. */
+            for (int j = h->short_ref_count - 1; j >= 0; j--) {
+                if (!h->mvc_active ||
+                    h->short_ref[j]->view_id == h->cur_view_id) {
+                    unreference_pic(h, h->short_ref[j], 0);
+                    remove_short_at_index(h, j);
+                }
             }
-            for (int j = 0; j < 16; j++)
-                remove_long(h, j, 0);
+            for (int j = 0; j < 16; j++) {
+                if (h->long_ref[j] &&
+                    (!h->mvc_active ||
+                     h->long_ref[j]->view_id == h->cur_view_id))
+                    remove_long(h, j, 0);
+            }
             poc->frame_num = h->cur_pic_ptr->frame_num = 0;
             h->mmco_reset = 1;
             h->cur_pic_ptr->mmco_reset = 1;
-            for (int j = 0; j < FF_ARRAY_ELEMS(h->last_pocs); j++)
-                h->last_pocs[j] = INT_MIN;
+            if (h->cur_view_id) {
+                for (int j = 0; j < FF_ARRAY_ELEMS(h->last_pocs_dep); j++)
+                    h->last_pocs_dep[j] = INT_MIN;
+            } else {
+                for (int j = 0; j < FF_ARRAY_ELEMS(h->last_pocs); j++)
+                    h->last_pocs[j] = INT_MIN;
+            }
             break;
         }
         default: av_assert0(0);

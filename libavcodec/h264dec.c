@@ -498,9 +498,15 @@ static void idr(H264Context *h)
         h->dep_view_poc.prev_poc_msb          = 1<<16;
         h->dep_view_poc.prev_poc_lsb          = -1;
     }
-    for (i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++) {
-        h->last_pocs[i] = INT_MIN;
-        h->last_pocs_dep[i] = INT_MIN;
+    if (h->mvc_active) {
+        int *lp = h->cur_view_id ? h->last_pocs_dep : h->last_pocs;
+        for (i = 0; i < H264_MAX_DPB_FRAMES; i++)
+            lp[i] = INT_MIN;
+    } else {
+        for (i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++) {
+            h->last_pocs[i] = INT_MIN;
+            h->last_pocs_dep[i] = INT_MIN;
+        }
     }
 }
 
@@ -512,7 +518,14 @@ void ff_h264_flush_change(H264Context *h)
     h->next_outputed_poc = INT_MIN;
     h->next_outputed_poc_dep = INT_MIN;
     h->prev_interlaced_frame = 1;
-    idr(h);
+    /* Flush must remove ALL refs regardless of cur_view_id.
+     * idr() in MVC mode only removes one view's refs, so
+     * temporarily disable mvc_active for the flush. */
+    { int save_mvc = h->mvc_active;
+      h->mvc_active = 0;
+      idr(h);
+      h->mvc_active = save_mvc;
+    }
 
     h->poc.prev_frame_num = -1;
     h->dep_view_poc.prev_frame_num = -1;
@@ -892,9 +905,9 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                     get_bits_left(&tmp_gb) >= 0) {
                     if (!h->mvc_active)
                         h->mvc_active = 1;
-                    for (unsigned i = 0; i < num_views; i++) {
-                        int vid = get_ue_golomb_long(&tmp_gb);
-                        if (vid >= 0 && vid <= 1023) {
+                    for (unsigned i = 0; i < num_views && get_bits_left(&tmp_gb) > 0; i++) {
+                        unsigned vid = get_ue_golomb_long(&tmp_gb);
+                        if (vid <= 1023) {
                             ret = h264_register_view_id(h, vid);
                             if (ret < 0)
                                 goto end;
@@ -1487,8 +1500,10 @@ static int h264_drain_mvc_pending(H264Context *h)
     while (avpriv_packet_list_get(&h->mvc_pending_pkts, pkt) >= 0) {
         ret = h264_decode_packet(h, pkt);
         av_packet_unref(pkt);
-        if (ret < 0)
+        if (ret < 0) {
+            avpriv_packet_list_free(&h->mvc_pending_pkts);
             break;
+        }
     }
     av_packet_free(&pkt);
     return ret;
@@ -1551,7 +1566,9 @@ get_packet:
     if (h->mvc_active && !h->is_avc &&
         !avctx->internal->is_frame_mt &&
         h264_is_dep_view_packet(avpkt->data, avpkt->size)) {
-        avpriv_packet_list_put(&h->mvc_pending_pkts, avpkt, NULL, 0);
+        ret = avpriv_packet_list_put(&h->mvc_pending_pkts, avpkt, NULL, 0);
+        if (ret < 0)
+            return ret;
         goto get_packet;
     }
 
