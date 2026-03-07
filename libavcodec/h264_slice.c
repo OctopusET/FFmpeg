@@ -1547,9 +1547,11 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
         const H264Picture *prev = h->short_ref_count ? h->short_ref[0] : NULL;
         av_log(h->avctx, AV_LOG_DEBUG, "Frame num gap %d %d\n",
                poc->frame_num, poc->prev_frame_num);
-        if (!sps->gaps_in_frame_num_allowed_flag)
-            for(i=0; i<FF_ARRAY_ELEMS(h->last_pocs); i++)
-                h->last_pocs[i] = INT_MIN;
+        if (!sps->gaps_in_frame_num_allowed_flag) {
+            int *last_pocs = h->cur_view_id ? h->last_pocs_dep : h->last_pocs;
+            for (i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++)
+                last_pocs[i] = INT_MIN;
+        }
         ret = h264_frame_start(h);
         if (ret < 0) {
             h->first_field = 0;
