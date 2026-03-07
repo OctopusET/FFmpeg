@@ -1483,7 +1483,13 @@ static int h264_is_dep_view_packet(const uint8_t *buf, int buf_size)
 
 /**
  * Drain all accumulated dep-view packets from the pending list.
- * Called after a base view packet is decoded, so inter-view refs are available.
+ *
+ * In MPEG-TS with merged MVC PIDs, dep view PES packets often arrive
+ * BEFORE the base view PES for the same access unit (different PIDs,
+ * non-deterministic mux ordering).  h264_receive_frame() accumulates
+ * these in mvc_pending_pkts.  After the base view packet is decoded
+ * (so the inter-view reference picture is in the DPB), this function
+ * drains the accumulated packets.
  */
 static int h264_drain_mvc_pending(H264Context *h)
 {
@@ -1560,9 +1566,11 @@ get_packet:
 
     /* MVC packet reordering: accumulate dep-view-only packets and decode
      * them after the base view packet.
-     * Skip when frame threading is active -- each worker gets one packet,
-     * so the accumulate-and-drain pattern doesn't work. Dep view slices
-     * are skipped by the EXTEN_SLICE handler instead. */
+     * !is_avc: AVC (MP4) format lacks start codes, so we can't scan raw
+     * packet data to classify dep-view-only packets.
+     * !is_frame_mt: frame threading gives each worker one packet, so the
+     * accumulate-and-drain pattern doesn't work (dep view slices are
+     * skipped by the EXTEN_SLICE handler instead). */
     if (h->mvc_active && !h->is_avc &&
         !avctx->internal->is_frame_mt &&
         h264_is_dep_view_packet(avpkt->data, avpkt->size)) {
@@ -1574,7 +1582,12 @@ get_packet:
 
     /* MVC: drain accumulated dep-view packets BEFORE the next base view
      * packet. This ensures dep B-frames from the current GOP are decoded
-     * while their base view references are still in the DPB. */
+     * while their base view references are still in the DPB.
+     *
+     * MVC_IV_REF: temporarily protect the base view picture from being
+     * freed by dep view MMCO or sliding window operations.  Without this,
+     * dep view decoding could remove the base picture that dep view slices
+     * need for inter-view prediction.  Cleared after draining completes. */
     if (!avctx->internal->is_frame_mt && h->mvc_active) {
         if (h->cur_pic_ptr && !h->cur_pic_ptr->view_id) {
             h->mvc_base_pic = h->cur_pic_ptr;

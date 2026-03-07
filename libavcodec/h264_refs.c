@@ -139,7 +139,10 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
 {
     int len;
 
-    /* MVC: filter shared DPB into per-view arrays (H.264 Annex H, H.8.4) */
+    /* MVC: filter shared DPB into per-view arrays (H.264 Annex H, H.8.4).
+     * Both views share DPB[36], so without filtering, a dep view slice
+     * would build its ref list from base view pictures (wrong view_id,
+     * same frame_num), producing corrupt predictions. */
     H264Picture *view_short_ref[32];
     int view_short_count = 0;
     H264Picture *view_long_ref[32] = { NULL };
@@ -645,7 +648,9 @@ static H264Picture *find_short(H264Context *h, int frame_num, int *idx)
         H264Picture *pic = h->short_ref[i];
         if (h->avctx->debug & FF_DEBUG_MMCO)
             av_log(h->avctx, AV_LOG_DEBUG, "%d %d %p\n", i, pic->frame_num, pic);
-        /* MVC: match both frame_num and view_id */
+        /* MVC: match both frame_num and view_id.  Both views in the same
+         * access unit share the same frame_num -- matching frame_num alone
+         * would return the wrong view's picture. */
         if (pic->frame_num == frame_num &&
             pic->view_id == h->cur_view_id) {
             *idx = i;
@@ -712,6 +717,11 @@ static H264Picture *remove_long(H264Context *h, int i, int ref_mask)
     return pic;
 }
 
+/**
+ * Remove all references belonging to one view from short_ref/long_ref.
+ * Called for per-view IDR: base view IDR must not destroy dep view refs
+ * (the dep view still needs them), and vice versa.
+ */
 void ff_h264_remove_view_refs(H264Context *h, int view_id)
 {
     for (int i = 0; i < 16; i++) {
@@ -761,11 +771,14 @@ static void generate_sliding_window_mmcos(H264Context *h)
     int view_long_count = 0;
     int oldest_view_idx = -1;
 
-    /* Count same-view references only */
+    /* Count same-view references only.  Each view has its own
+     * ref_frame_count limit; cross-view refs don't count against it. */
     for (int i = 0; i < h->short_ref_count; i++) {
         if (h->short_ref[i]->view_id == h->cur_view_id) {
             view_short_count++;
-            oldest_view_idx = i;  /* last match = highest index = oldest */
+            /* short_ref[] is ordered newest (0) to oldest, so the
+             * last match has the highest index = oldest same-view ref. */
+            oldest_view_idx = i;
         }
     }
     for (int i = 0; i < 16; i++) {
@@ -965,8 +978,11 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
                 }
             }
             if (pic) {
-                /* MVC: accumulate-and-drain may produce a duplicate
-                 * short_ref entry. Not an error. */
+                /* MVC: the parser may split dep view NALs into a separate
+                 * packet AND also include some in the base view packet.
+                 * Accumulate-and-drain then decodes both, so the same
+                 * picture is added to short_ref twice.  In non-MVC this
+                 * indicates a corrupt bitstream. */
                 if (!h->mvc_active) {
                     av_log(h->avctx, AV_LOG_ERROR,
                            "illegal short term buffer state detected\n");
@@ -985,7 +1001,9 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
     }
 
     {
-        /* DPB overflow check (per-view for MVC). */
+        /* DPB overflow check (per-view for MVC).  Count only same-view
+         * refs against ref_frame_count to prevent one view from evicting
+         * the other view's references. */
         int view_short = 0, view_long = 0;
         for (int i = 0; i < h->short_ref_count; i++)
             if (h->short_ref[i]->view_id == h->cur_view_id)

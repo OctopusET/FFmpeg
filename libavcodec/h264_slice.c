@@ -515,6 +515,9 @@ static int h264_frame_start(H264Context *h)
 
     pic->reference              = h->droppable ? 0 : h->picture_structure;
     pic->field_picture          = h->picture_structure != PICT_FRAME;
+    /* MVC: frame_num is tracked per-view in the POC context because
+     * MMCO_RESET can set frame_num=0 for one view while the other
+     * view's frame_num continues incrementing. */
     pic->frame_num               = h->cur_view_id ? h->dep_view_poc.frame_num
                                                     : h->poc.frame_num;
     /*
@@ -545,6 +548,8 @@ static int h264_frame_start(H264Context *h)
         return ret;
 
     h->cur_pic_ptr = pic;
+    /* MVC: tag picture with view_id so DPB filtering (h264_refs.c)
+     * can separate per-view reference lists.  For non-MVC, always 0. */
     pic->view_id = h->cur_view_id;
     ff_h264_unref_picture(&h->cur_pic);
     if (CONFIG_ERROR_RESILIENCE) {
@@ -1420,7 +1425,8 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
 {
     int i;
     const SPS *sps;
-    /* MVC: select per-view POC context */
+    /* MVC: each view tracks POC state independently (prev_poc_msb/lsb,
+     * frame_num_offset, etc.).  See h264_picture.c for the rationale. */
     H264POCContext *const poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
 
     int last_pic_structure, last_pic_droppable, ret;

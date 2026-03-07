@@ -152,6 +152,9 @@ typedef struct H264Picture {
 /**
  * H264Picture.reference has this flag set while the picture is needed
  * as an inter-view reference for MVC dependent view decoding.
+ * Set in h264_receive_frame() before draining dep view packets,
+ * cleared after draining.  Prevents MMCO/sliding window from freeing
+ * the base view picture while dep view slices still need it.
  */
 #define MVC_IV_REF       (1 << 3)
     int reference;

@@ -195,7 +195,9 @@ int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup)
     h->mb_y = 0;
 
     if (in_setup || !(avctx->active_thread_type & FF_THREAD_FRAME)) {
-        /* MVC: select per-view POC context */
+        /* MVC: each view tracks POC state independently.  Without this,
+         * the dep view's slice header overwrites prev_poc_msb/lsb, and
+         * the next base view slice computes POC from wrong state. */
         H264POCContext *const poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
         if (!h->droppable) {
             err = ff_h264_execute_ref_pic_marking(h);
