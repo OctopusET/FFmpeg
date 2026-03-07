@@ -456,14 +456,57 @@ slice header). They do NOT share the same POC -- the dependent view's POC
 is computed independently and may differ by 1 from the base view.
 
 **Key insight**: Use `frame_num` (not POC) to identify the inter-view
-reference. In `h264_initialise_ref_list()`:
+reference. Two lookup mechanisms:
+
+1. **`mvc_base_pic` pointer** (preferred): In `h264_receive_frame()`, before
+   draining dep view packets, the current base view picture is saved as
+   `h->mvc_base_pic` with `MVC_IV_REF` flag protection to prevent premature
+   unreferencing during dep view decoding. This is the fastest and most
+   reliable lookup.
+
+2. **DPB scan** (fallback): If `mvc_base_pic` is NULL or doesn't match,
+   scan `h->DPB[]` for a picture with matching `frame_num` and different
+   `view_id`. This covers edge cases where the pointer wasn't set.
+
+In `h264_initialise_ref_list()` and ref list modification (idc=4/5):
 
 ```c
-for (i = 0; i < h->short_ref_count; i++) {
-    if (h->short_ref[i]->view_id == 0 &&           // base view
-        h->short_ref[i]->frame_num == cur_frame_num) // same AU
-        -> this is the inter-view reference
+// Preferred: direct pointer
+if (h->mvc_base_pic && h->mvc_base_pic->f->buf[0] &&
+    h->mvc_base_pic->view_id != h->cur_view_id &&
+    h->mvc_base_pic->frame_num == cur_frame_num) {
+    ref = h->mvc_base_pic;
 }
+// Fallback: DPB scan
+for (int j = 0; j < H264_MAX_PICTURE_COUNT; j++) {
+    if (h->DPB[j].f->buf[0] &&
+        h->DPB[j].view_id != h->cur_view_id &&
+        h->DPB[j].frame_num == cur_frame_num) ...
+}
+```
+
+### MVC_IV_REF Protection
+
+The `MVC_IV_REF` flag (bit 3 in `H264Picture.reference`) prevents the base
+view picture from being freed while the dependent view is decoding. Without
+this, dep view MMCO or sliding window operations could remove the base view
+picture that dep view slices need for inter-view prediction.
+
+```c
+// In h264_receive_frame(), before draining dep packets:
+h->mvc_base_pic = h->cur_pic_ptr;
+h->mvc_base_pic->reference |= MVC_IV_REF;
+
+// After draining:
+h->mvc_base_pic->reference &= ~MVC_IV_REF;
+h->mvc_base_pic = NULL;
+```
+
+The `MVC_IV_REF` flag is also checked in `ff_h264_build_ref_list()` to
+suppress false "Missing reference picture" errors:
+```c
+if (!FIELD_PICTURE(h) && !(ref & MVC_IV_REF) && (ref & 3) != 3)
+    // error: missing reference
 ```
 
 ### Placement in Reference List
@@ -477,53 +520,83 @@ RefPicList0 = [temporal_ref_1, temporal_ref_2, ..., inter_view_ref]
 ```
 
 The inter-view ref is added at the first empty slot (where `parent == NULL`)
-in the reference list.
+in the reference list. For field pictures, `pic_as_field()` adapts the
+frame reference to the current field's parity. For frame pictures, the
+reference bits are set to `PICT_FRAME`.
 
-### When Inter-View Ref is Not Found
+### Reference List Modification (idc=4 and idc=5)
 
-If the base view picture for the current access unit isn't in `short_ref[]`
-yet (e.g., due to packet ordering -- dependent view PES arrived before
-base view PES), the inter-view reference is simply not added. This causes
-"reference picture missing during reorder" errors but doesn't crash.
+The MVC bitstream uses idc=4 (inter-view short-term) and idc=5 (inter-view
+long-term) in `ref_pic_list_modification()` to place the inter-view
+reference at specific positions in the reference list:
 
-This is a known limitation. Possible solutions:
-- Reorder packets at demuxer level (complex)
-- Buffer access units and decode views in order (requires `receive_frame`)
-- Accept the error for the first few frames (current approach)
+- **idc=4**: Find a short-term reference from a DIFFERENT view with the
+  same `frame_num`. Search `short_ref[]` for `view_id != cur_view_id`.
+
+- **idc=5**: Same, but treated as a long-term inter-view reference. Uses
+  `mvc_base_pic` first, then falls back to DPB scan. The `pic_structure`
+  is initialized from `h->picture_structure` for correct field handling.
+
+### MVC Packet Reordering (Accumulate-and-Drain)
+
+MPEG-TS PES packet ordering between PIDs is not guaranteed. In practice,
+dependent view PES packets often arrive BEFORE the base view PES for the
+same access unit. This creates a chicken-and-egg problem: the dependent
+view needs the base view as an inter-view reference, but the base view
+hasn't been decoded yet.
+
+**Solution** (in `h264_receive_frame()`):
+
+1. When a dep-view-only packet arrives (detected by `h264_is_dep_view_packet()`
+   which scans for EXTEN_SLICE NALs without any SLICE/IDR_SLICE NALs),
+   accumulate it in `h->mvc_pending_pkts` (PacketList).
+
+2. When a base view packet arrives, decode it first, then drain all pending
+   dep view packets via `h264_drain_mvc_pending()`.
+
+3. Before draining, set `h->mvc_base_pic` with `MVC_IV_REF` protection so
+   the base view picture survives dep view decoding.
+
+This ensures the base view picture is always in the DPB before any dep view
+slice needs it. The only lost frame is the very first dep view extent in
+SSIF files (lazy linking timing).
 
 
 ## 8. POC (Picture Order Count) Handling
 
-### Current State
+### Per-View POC Contexts
 
-Both views share a single `H264POCContext` (`h->poc`). This means the
-dependent view's POC computation is affected by the base view's state:
-
-```
-Base IDR:    poc = 0      (poc_lsb=0, prev_poc_msb=0, prev_poc_lsb=0)
-Dep IDR:     poc = 1      (poc_lsb=1, prev state from base IDR)
-Base P fn=1: poc = 65536  (poc_lsb=0, prev state from dep IDR)
-Dep P fn=1:  poc = 65537  (poc_lsb=1, prev state from base P)
-```
-
-The POC values differ between views (off by 1 in this example). This is
-why inter-view references are looked up by `frame_num` instead of POC.
-
-### Correct Approach (TODO)
-
-Each view should have its own `H264POCContext` for independent POC tracking:
+Each view has its own `H264POCContext` for independent POC tracking:
 
 ```c
-H264POCContext view_poc[2];  // per-view POC state
+// In H264Context (h264dec.h):
+H264POCContext poc;          // base view (view_id=0)
+H264POCContext dep_view_poc; // dependent view (view_id>0)
 
-// In slice processing:
-int view_idx = (h->cur_view_id > 0) ? 1 : 0;
-h264_init_poc(... &h->view_poc[view_idx] ...);
+// Selected throughout the code via:
+H264POCContext *poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
 ```
 
-This would give each view correct POC values (e.g., both views at t=0
-would have POC=0). Currently not implemented -- the shared POC works
-because we use frame_num for inter-view lookup.
+Without separation, the dep view's slice header overwrites `prev_poc_msb`
+and `prev_poc_lsb` in the shared POC context. When the next base view
+slice arrives, it computes POC from the dep view's leftover state,
+producing incorrect POC values and dropped frames.
+
+Used in: `ff_h264_field_end()`, `h264_select_output_frame()`,
+`ff_h264_queue_decode_slice()`, `idr()`, and MMCO_RESET.
+
+### IDR and POC Reset
+
+- Base view IDR: `idr()` resets `h->poc` from `decode_nal_units()`
+- Dep view anchor: POC reset in `ff_h264_queue_decode_slice()`:
+  ```c
+  if (h->idr_pic_flag && h->cur_view_id && h->mvc_active) {
+      poc->prev_frame_num = poc->prev_frame_num_offset = 0;
+      poc->prev_poc_msb = 1<<16; poc->prev_poc_lsb = -1;
+  }
+  ```
+- MMCO_RESET: resets only current view's POC and `last_pocs`/`last_pocs_dep`
+- Flush/seek: temporarily disables `mvc_active` so `idr()` resets both views
 
 
 ## 9. Output and Frame Threading
@@ -531,13 +604,22 @@ because we use frame_num for inter-view lookup.
 ### Frame Threading Limitation
 
 MVC decoding is incompatible with frame threading because:
-- The parser splits each view's NALs into separate packets
-- Frame threading requires one complete frame per decode call
-- With MVC, two pictures (base + dependent) are produced per access unit
+- The single DPB design requires both views decoded in the same thread
+  context (the dep view needs the base view's picture in the same DPB)
+- Frame threading gives each worker its own H264Context copy
 
-Currently, MVC extension slices are silently processed in all threading
-modes. For correctness, frame threading should be disabled when MVC NALs
-are detected.
+**Auto-detection**: When MVC profiles (118=Multiview High, 128=Stereo High)
+are detected in any SPS during `h264_decode_init()`, frame threading is
+automatically disabled (`avctx->active_thread_type &= ~FF_THREAD_FRAME`).
+
+**Runtime guard**: If frame threading is still active when an EXTEN_SLICE
+NAL is encountered (e.g., profile wasn't detected in extradata), the dep
+view slices are skipped with a log-once warning:
+```
+MVC: frame threading active, skipping dep view 1 (use -thread_type slice for both views)
+```
+
+Slice threading works fine with MVC -- all slices share the same DPB.
 
 ### Output FIFO (Implemented)
 
@@ -554,6 +636,50 @@ For MVC, both views' frames are pushed and drained one at a time.
 
 Frame threading works via `ff_thread_receive_frame()` +
 `ff_thread_get_packet()` (same as HEVC multiview decoder).
+
+### Per-View Reorder Buffers
+
+H.264 outputs decoded pictures in POC order using a reorder buffer
+(`delayed_pic[]`). For MVC, the two views have interleaved but independent
+POC sequences. If both views share a single reorder buffer, the
+out-of-order detection logic (`out->poc < next_outputed_poc`) incorrectly
+drops frames when view POCs interleave.
+
+**Root cause example** (interlaced MVC with B-frames):
+```
+Base  view: poc=65536, 65538, 65540, ...
+Dep   view: poc=65537, 65539, 65541, ...
+In shared delayed_pic[]: 65536, 65537, 65538, 65539, ...
+
+When dep poc=65540 is output before base poc=65538:
+  next_outputed_poc = 65540
+  base poc=65538 < 65540 -> dropped as "ooo" (out-of-order)
+```
+
+**Solution**: Separate reorder buffers per view:
+```c
+H264Picture *delayed_pic[H264_MAX_DPB_FRAMES + 2];      // base view
+H264Picture *delayed_pic_dep[H264_MAX_DPB_FRAMES + 2];  // dep view
+int last_pocs[H264_MAX_DPB_FRAMES];                      // base view
+int last_pocs_dep[H264_MAX_DPB_FRAMES];                  // dep view
+int next_outputed_poc;                                    // base view
+int next_outputed_poc_dep;                                // dep view
+```
+
+In `h264_select_output_frame()`:
+```c
+int is_dep = cur->view_id && h->mvc_active;
+H264Picture **delayed = is_dep ? h->delayed_pic_dep : h->delayed_pic;
+int *last_pocs        = is_dep ? h->last_pocs_dep   : h->last_pocs;
+int *next_poc         = is_dep ? &h->next_outputed_poc_dep : &h->next_outputed_poc;
+```
+
+All init/flush/close paths must handle both arrays. `unreference_pic()` must
+check both `delayed_pic[]` AND `delayed_pic_dep[]` to protect pictures held
+for delayed output.
+
+**EOF drain**: `h264_flush_delayed_to_fifo()` drains base queue first, then
+dep queue, via the shared `h264_flush_delayed_queue()` helper.
 
 ### AV_FRAME_DATA_VIEW_ID Side Data (Implemented)
 
@@ -581,51 +707,102 @@ were detected in the stream.
 1. **Dependent view IDR not added to short_ref**: Fixed by introducing
    `idr_pic_flag` (H264Context) to decouple IdrPicFlag from nal_unit_type.
    MVC anchor pictures (non_idr_flag=0) now correctly read idr_pic_id and
-   dec_ref_pic_marking IDR syntax. `picture_idr` is only set for base view
-   to prevent DPB clearing on dependent view anchors.
+   dec_ref_pic_marking IDR syntax.
 
 2. **find_short view mismatch**: Fixed by adding view_id matching in
    `find_short()` -- two MVC views share the same frame_num, so matching
    frame_num alone returned the wrong picture.
 
 3. **Thread context update**: Fixed by copying `picture_idr`, `cur_view_id`,
-   `idr_pic_flag`, and `mvc_active` in `ff_h264_update_thread_context()`.
+   `idr_pic_flag`, `mvc_active`, and per-view reorder state in
+   `ff_h264_update_thread_context()`.
 
 4. **Per-view POC context**: Split `h->poc` into base and dependent view
-   contexts (`h->poc` + `h->dep_view_poc`). Each view's slice headers carry
-   independent POC parameters; without separation the dep view overwrote
-   the base view's prev_poc_msb/lsb tracking.
+   contexts (`h->poc` + `h->dep_view_poc`).
 
 5. **NAL type 20 in get_last_needed_nal**: Added EXTEN_SLICE handling with
    4-byte header offset (1 NAL header + 3 MVC extension) to correctly reach
    first_mb_in_slice.
 
-6. **False errors from dep view packets**: When MVC dep view PES packets
-   merged into the base view stream contain only EXTEN_SLICE NALs (skipped
-   by view_ids filtering), the decoder no longer reports "no frame!" errors.
-   Fixed by checking `h->mvc_active`.
+6. **False errors from dep view packets**: Fixed by checking `h->mvc_active`
+   in the "no frame!" error path.
+
+7. **Inter-view prediction**: Fully implemented. Base view picture is
+   appended to dep view ref list, protected by MVC_IV_REF during decode.
+   Both idc=4 (inter-view short-term) and idc=5 (inter-view long-term)
+   ref list modifications are handled.
+
+8. **Packet ordering**: Fixed with accumulate-and-drain pattern. Dep view
+   PES packets are buffered in `mvc_pending_pkts` and decoded after the
+   base view packet.
+
+9. **Interlaced MVC**: Working. Per-view reorder buffers
+   (`delayed_pic_dep[]`, `last_pocs_dep[]`, `next_outputed_poc_dep`)
+   prevent cross-view POC drops. `pic_as_field()` adapts inter-view refs
+   for field pictures.
+
+10. **MMCO_RESET infinite loop**: Fixed by iterating `short_ref[]`
+    backwards with `remove_short_at_index()` directly (view-filtered),
+    instead of using `remove_short()` which calls `find_short()` and
+    can't find cross-view entries.
+
+11. **GOP boundary stale dep slices**: Fixed with `mvc_base_idr_decoded`
+    flag. After base IDR, non-anchor dep slices from the old GOP are
+    skipped.
+
+12. **h264_register_view_id realloc dangling pointer**: Fixed by
+    reassigning both `view_ids_available` and `view_pos_available`
+    after each realloc.
 
 ### Known Issues (Remaining)
 
-1. **Packet ordering**: MPEG-TS PES packets from the dependent view PID
-   may arrive before the base view PID for the same access unit. Causes
-   1 "Missing reference" error for the first dep non-IDR frame.
-
-2. **Inter-view prediction**: Dependent view P-slices reference the base
-   view picture for inter-view prediction (same POC, different view_id).
-   The ref list builder does not yet add inter-view refs, causing
-   concealment errors (~10-20 per GOP) in the dep view.
-
-3. **Non-monotonic DTS**: Both views output frames with the same timestamps,
+1. **Non-monotonic DTS**: Both views output frames with the same timestamps,
    triggering "non monotonically increasing dts" muxer warnings. This is
-   expected with frame-sequential stereo output; a proper stereo-aware
-   muxer would handle it.
+   expected with frame-sequential stereo output (same as HEVC multiview).
 
-### Remaining Implementation
+2. **Interlaced "Missing reference" warnings**: ~3-24 per interlaced stream
+   at GOP boundaries where dep view MMCO operates on pictures already
+   cleared by base view. Cosmetic -- fallback refs are used, output is
+   correct.
 
-- [ ] Inter-view reference prediction (add base view pic to dep view ref list)
-- [ ] Test with more MVC content (Blu-ray 3D, different cameras)
-- [ ] Consider DTS adjustment for frame-sequential stereo output
+3. **SSIF first dep frame lost**: In SSIF files, lazy linking happens after
+   the base view is probed. The first 1-2 dep view packets arrive before
+   linking and are dropped.
+
+4. **View specifiers** (`-map 0:v:vpos:left`): Don't work for MPEG-TS MVC
+   because Subset SPS arrives in a separate PES packet after `get_format()`
+   already fired. Use `-view_ids -1` instead.
+
+5. **1 dep frame lost at EOF**: For interlaced streams, one dep view frame
+   may remain in the per-view reorder buffer at EOF.
+
+6. **Frame threading + MVC**: Dep view is skipped (auto-detected and warned).
+   Slice threading works fine.
+
+7. **>2 views**: Only stereo (2 views) tested. Inter-view ref lookup uses
+   `view_id != cur_view_id`, which works for 2 views but may need refinement
+   for >2 views.
+
+8. **Hardware acceleration**: MVC slices use software decode path only.
+
+### All Implementation Complete
+
+- [x] MPEG-TS PID merging + SSIF lazy linking
+- [x] NAL type 14/15/20 handling in decoder
+- [x] Per-view POC contexts
+- [x] Inter-view reference prediction (idc=4 and idc=5)
+- [x] MVC_IV_REF protection for inter-view refs
+- [x] Per-view reorder buffers (interlaced MVC)
+- [x] Per-view sliding window and DPB overflow check
+- [x] Per-view MMCO_RESET (view-filtered iteration)
+- [x] Accumulate-and-drain packet reordering
+- [x] Output FIFO (receive_frame)
+- [x] view_ids option + AV_FRAME_DATA_VIEW_ID side data
+- [x] Stereo3D side data
+- [x] Frame threading auto-disable
+- [x] GOP boundary stale dep slice detection
+- [x] FATE regression test
+- [x] Full code audit (all MVC files reviewed)
 
 
 ## 11. File Map
@@ -634,13 +811,13 @@ were detected in the stream.
 
 | File                          | Changes                                      |
 |-------------------------------|----------------------------------------------|
-| `libavformat/mpegts.c`        | MVC PID merging in `pmt_cb()`                |
-| `libavcodec/h264dec.h`        | `H264Picture.view_id`, `H264Context.{cur_view_id,idr_pic_flag,mvc_active,dep_view_poc,view_ids,output_fifo}` |
-| `libavcodec/h264dec.c`        | NAL type 14/15/20 handling, `receive_frame`, output FIFO, `view_ids` option, view_id side data, `get_last_needed_nal` NAL 20 |
-| `libavcodec/h264_slice.c`     | `pic->view_id`, `idr_pic_flag` usage, thread context update, per-view POC in `h264_field_start` |
-| `libavcodec/h264_picture.c`   | `view_id` propagation, per-view POC in `ff_h264_field_end` |
-| `libavcodec/h264_refs.c`      | Per-view ref lists, inter-view refs, per-view sliding window, per-view DPB overflow, per-view MMCO_RESET |
-| `libavcodec/h264_parser.c`    | MVC NAL type 20 frame boundary, idc 4/5 in reordering |
+| `libavformat/mpegts.c`        | MVC PID merging in `pmt_cb()`, SSIF lazy linking |
+| `libavcodec/h264dec.h`        | `H264Picture.view_id`, `MVC_IV_REF`, per-view reorder buffers (`delayed_pic_dep[]`, `last_pocs_dep[]`, `next_outputed_poc_dep`), `H264Context.{cur_view_id,idr_pic_flag,mvc_active,mvc_base_pic,mvc_base_idr_decoded,dep_view_poc,mvc_pending_pkts,view_ids,output_fifo}` |
+| `libavcodec/h264dec.c`        | NAL type 14/15/20 handling, `receive_frame`, output FIFO, accumulate-and-drain (`h264_is_dep_view_packet`, `h264_drain_mvc_pending`), `view_ids` option, `AV_FRAME_DATA_VIEW_ID` + `AVStereo3D` side data, `get_last_needed_nal` NAL 20, per-view reorder in `h264_select_output_frame`, `h264_flush_delayed_to_fifo`, frame threading auto-disable |
+| `libavcodec/h264_slice.c`     | `pic->view_id`, `idr_pic_flag` decoupling, thread context update (incl. per-view reorder state), per-view POC selection, dep view anchor POC reset, `mvc_base_idr_decoded` stale-slice skip |
+| `libavcodec/h264_picture.c`   | `view_id` propagation in `h264_copy_picture_params`, per-view POC in `ff_h264_field_end` |
+| `libavcodec/h264_refs.c`      | Per-view ref lists (`find_short` view filter), inter-view refs (`mvc_base_pic` + DPB fallback), `MVC_IV_REF` check, `pic_as_field()` for interlaced, per-view sliding window, per-view DPB overflow, per-view MMCO_RESET (view-filtered iteration), `unreference_pic` delayed_pic_dep check, `ff_h264_remove_view_refs()`, idc=4/5 ref list modification |
+| `libavcodec/h264_parser.c`    | MVC NAL type 20 frame boundary (4-byte header offset), Subset SPS parsing, idc 4/5 in reordering |
 
 ### Pre-existing Files (Phase 1-2, already committed)
 
@@ -690,25 +867,25 @@ were detected in the stream.
 
 ## Known Limitations
 
-- **Interlaced MVC**: dep view skipped (field-pair ref management needs work)
-- **Frame threading + MVC**: dep view skipped (inter-view ref needs base
-  view decoded in same thread context)
-- **>2 views**: only stereo (2 views) tested; inter-view ref lookup
-  hardcodes view_id=0 as base
-- **idc=5 long-term ref**: logs warning, not implemented (rarely used)
+See Section 10 for the full list. Summary:
+
+- **Frame threading + MVC**: dep view auto-skipped (single-DPB design)
+- **>2 views**: only stereo (2 views) tested
 - **MVC in MP4/MKV**: only MPEG-TS tested; may need container work
 - **Hardware acceleration**: MVC slices use software decode path only
 - **SSIF**: 1-2 frames lost at stream start (lazy linking timing)
-- **View specifiers** (`-map 0:v:vpos:left`): don't work for MPEG-TS MVC
-  because Subset SPS arrives too late; use `-view_ids -1` instead
+- **View specifiers** (`-map 0:v:vpos:left`): don't work for MPEG-TS MVC;
+  use `-view_ids -1` instead
+- **Non-monotonic DTS**: expected with frame-sequential stereo output
+- **Interlaced "Missing reference" warnings**: cosmetic, at GOP boundaries
+- **1 dep frame lost at EOF**: interlaced streams, stays in reorder buffer
 
 ## Future Work
 
-1. **More samples**: different containers, interlaced, B-frame heavy, >2 views
-2. **Clean patch series**: reimplement from `doc/mvc_upstream_guide.md`
-3. **MP4/MKV container support**: if needed based on sample testing
-4. **Interlaced MVC**: field-pair ref management for interlaced streams
-5. **Hardware acceleration**: extend hwaccel backends for MVC NAL types
+1. **Clean patch series**: reimplement from `doc/mvc_upstream_guide.md`
+2. **MP4/MKV container support**: if needed based on sample testing
+3. **Hardware acceleration**: extend hwaccel backends for MVC NAL types
+4. **>2 views**: extend inter-view ref lookup for multiview (>2)
 
 Note: other stereoscopic 3D formats (frame-packing, side-by-side, top-bottom)
 are already supported by FFmpeg and do not require MVC decoding. MVC is

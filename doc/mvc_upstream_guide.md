@@ -225,6 +225,13 @@ int idr_pic_flag;
  * and populate view_ids_available.
  */
 int mvc_active;
+
+/**
+ * Set when base view IDR is decoded, cleared when dep view anchor
+ * (non_idr_flag=0) is seen. Used to detect stale dep slices from
+ * the previous GOP after a base IDR (MPEG-TS PES ordering issue).
+ */
+int mvc_base_idr_decoded;
 ```
 
 ### 5b. Add view_id to H264Picture (h264dec.h)
@@ -354,9 +361,22 @@ h->idr_pic_flag    = h1->idr_pic_flag;
 h->mvc_active      = h1->mvc_active;
 ```
 
-And copy dep_view_poc (~line 423):
+Copy dep_view_poc (~line 423):
 ```c
 memcpy(&h->dep_view_poc, &h1->dep_view_poc, sizeof(h->dep_view_poc));
+```
+
+Copy per-view reorder state (for frame threading correctness):
+```c
+memcpy(h->delayed_pic_dep, h1->delayed_pic_dep, sizeof(h->delayed_pic_dep));
+memcpy(h->last_pocs_dep,   h1->last_pocs_dep,   sizeof(h->last_pocs_dep));
+h->next_outputed_poc_dep = h1->next_outputed_poc_dep;
+```
+
+And in the `copy_picture_range` section:
+```c
+copy_picture_range(h->delayed_pic_dep, h1->delayed_pic_dep,
+                   FF_ARRAY_ELEMS(h->delayed_pic_dep), h, h1);
 ```
 
 ---
@@ -509,14 +529,6 @@ case H264_NAL_EXTEN_SLICE: {
         break;
     }
 
-    /* Skip dep view for interlaced content (PATCHWELCOME in core H.264) */
-    if (h->ps.sps && FIELD_PICTURE(h)) {
-        av_log(avctx, AV_LOG_DEBUG,
-               "MVC: skipping dep view %d (interlaced not supported)\n",
-               h->cur_view_id);
-        break;
-    }
-
     /*
      * Rewrite NAL type: the slice header after the extension header
      * is standard H.264. By rewriting to IDR_SLICE or SLICE, we
@@ -631,24 +643,34 @@ additional reference for dependent view slices:
  *
  * For a dependent view slice, add the base view's picture
  * from the same access unit as an additional reference.
+ *
+ * Two lookup mechanisms:
+ * 1. mvc_base_pic pointer (preferred): set in h264_receive_frame()
+ *    before draining dep view packets, with MVC_IV_REF flag
+ *    protection to prevent premature unreferencing.
+ * 2. DPB scan (fallback): search for matching frame_num + different
+ *    view_id. Covers edge cases where the pointer wasn't set.
  */
 if (h->cur_view_id) {
     H264Picture *iv_ref = NULL;
     int cur_frame_num = h->cur_pic_ptr->frame_num;
 
-    /*
-     * Search the full DPB (not just short_ref[]) for the base view
-     * (view_id=0) picture with matching frame_num.
-     * We search the full DPB because droppable base view frames
-     * (nal_ref_idc==0) have reference=0 or DELAYED_PIC_REF and
-     * are NOT in short_ref[], but they ARE still in the DPB.
-     */
-    for (int i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
-        if (h->DPB[i].f->buf[0] &&
-            h->DPB[i].view_id == 0 &&
-            h->DPB[i].frame_num == cur_frame_num) {
-            iv_ref = &h->DPB[i];
-            break;
+    /* Preferred: direct pointer (set by h264_receive_frame) */
+    if (h->mvc_base_pic && h->mvc_base_pic->f->buf[0] &&
+        h->mvc_base_pic->view_id != h->cur_view_id &&
+        h->mvc_base_pic->frame_num == cur_frame_num) {
+        iv_ref = h->mvc_base_pic;
+    }
+
+    /* Fallback: DPB scan */
+    if (!iv_ref) {
+        for (int i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
+            if (h->DPB[i].f->buf[0] &&
+                h->DPB[i].view_id != h->cur_view_id &&
+                h->DPB[i].frame_num == cur_frame_num) {
+                iv_ref = &h->DPB[i];
+                break;
+            }
         }
     }
 
@@ -659,16 +681,32 @@ if (h->cur_view_id) {
                 ref_from_h264pic(&sl->ref_list[list][pos], iv_ref);
                 sl->ref_count[list]++;
                 /*
-                 * Droppable base view frame has reference=0 or
-                 * DELAYED_PIC_REF which would fail validation.
-                 * Override to PICT_FRAME so the inter-view ref
-                 * passes validation.
+                 * For field pictures, adapt the frame reference to
+                 * the current field's parity using pic_as_field().
+                 * For frame pictures, override to PICT_FRAME so
+                 * the inter-view ref passes validation (droppable
+                 * base view frames have reference=0 or DELAYED_PIC_REF).
                  */
-                sl->ref_list[list][pos].reference = PICT_FRAME;
+                if (FIELD_PICTURE(h)) {
+                    pic_as_field(&sl->ref_list[list][pos],
+                                 h->picture_structure);
+                } else {
+                    sl->ref_list[list][pos].reference = PICT_FRAME;
+                }
             }
         }
     }
 }
+
+/*
+ * MVC_IV_REF check: suppress false "Missing reference picture" errors.
+ * The base view picture protected by MVC_IV_REF may not have full
+ * reference bits (e.g. reference=4 only), which triggers the
+ * "reference picture missing" error. Skip the check for such pictures.
+ */
+// In the reference validation loop:
+if (!FIELD_PICTURE(h) && !(ref & MVC_IV_REF) && (ref & 3) != 3)
+    // error: missing reference
 ```
 
 ### 7e. Per-view filtering in ref_pic_list_modification (h264_refs.c)
@@ -712,12 +750,40 @@ case 4: {
     }
     break;
 }
-case 5:
-    /* MVC inter-view long-term ref modification (idc=5), not supported. */
-    av_log(h->avctx, AV_LOG_WARNING,
-           "MVC inter-view long-term ref modification not supported\n");
-    i = -1;
+case 5: {
+    /*
+     * MVC inter-view long-term ref modification (idc=5).
+     * (H.264 Annex H, modification_of_pic_nums_idc == 5)
+     *
+     * Same as idc=4 but for long-term inter-view refs.
+     * Find the inter-view reference from mvc_base_pic (preferred)
+     * or DPB scan (fallback). Initialize pic_structure from
+     * h->picture_structure for correct field handling.
+     */
+    int cur_frame_num = h->cur_pic_ptr->frame_num;
+    pic_structure = h->picture_structure;
+
+    /* Preferred: direct pointer (set by h264_receive_frame) */
+    if (h->mvc_base_pic && h->mvc_base_pic->f->buf[0] &&
+        h->mvc_base_pic->view_id != h->cur_view_id &&
+        h->mvc_base_pic->frame_num == cur_frame_num) {
+        ref = h->mvc_base_pic;
+        i = 0;
+        break;
+    }
+    /* Fallback: DPB scan */
+    for (i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
+        if (h->DPB[i].f->buf[0] &&
+            h->DPB[i].view_id != h->cur_view_id &&
+            h->DPB[i].frame_num == cur_frame_num) {
+            ref = &h->DPB[i];
+            break;
+        }
+    }
+    if (i >= H264_MAX_PICTURE_COUNT)
+        i = -1;
     break;
+}
 ```
 
 Update the idc validation to accept 4 and 5 (~line 620):
@@ -813,6 +879,183 @@ for (int i = 0; i < h->short_ref_count; i++)
     if (h->short_ref[i]->view_id == h->cur_view_id)
         oldest = i;
 ```
+
+### 7j. Per-view MMCO_RESET (h264_refs.c, MMCO_RESET case)
+
+When MMCO_RESET fires, it must remove only the current view's short-term
+refs. The naive approach of calling `remove_short()` in a loop can
+infinite-loop because `find_short()` (now view-filtered) can't find
+cross-view entries:
+
+```c
+case MMCO_RESET: {
+    H264POCContext *const poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
+
+    /*
+     * Remove short-term refs for the current view only.
+     * Iterate backwards so remove_short_at_index() doesn't
+     * shift indices we haven't visited yet.
+     */
+    for (int j = h->short_ref_count - 1; j >= 0; j--) {
+        if (h->short_ref[j]->view_id == h->cur_view_id) {
+            unreference_pic(h, h->short_ref[j], 0);
+            remove_short_at_index(h, j);
+        }
+    }
+
+    /* Remove long-term refs for the current view only */
+    for (int j = 0; j < 16; j++) {
+        if (h->long_ref[j] && h->long_ref[j]->view_id == h->cur_view_id)
+            remove_long(h, j, 0);
+    }
+
+    /* Reset per-view POC state */
+    poc->poc_msb = poc->poc_lsb = 0;
+    poc->prev_poc_msb = 1 << 16;
+    poc->prev_poc_lsb = -1;
+    ...
+}
+```
+
+### 7k. MVC_IV_REF flag and mvc_base_pic (h264dec.h)
+
+```c
+/**
+ * MVC inter-view reference protection flag.
+ * Bit 3 of H264Picture.reference. Prevents the base view picture
+ * from being freed while the dependent view is decoding.
+ * Set in h264_receive_frame() before draining dep view packets,
+ * cleared after draining completes.
+ */
+#define MVC_IV_REF    4
+
+/**
+ * Pointer to the base view picture for inter-view prediction.
+ * Set to h->cur_pic_ptr in h264_receive_frame() before draining
+ * dep view packets. Protected by MVC_IV_REF flag.
+ * Used by h264_initialise_ref_list() and idc=5 ref list modification.
+ */
+H264Picture *mvc_base_pic;
+```
+
+In `h264_receive_frame()`, before draining dep packets:
+```c
+h->mvc_base_pic = h->cur_pic_ptr;
+h->mvc_base_pic->reference |= MVC_IV_REF;
+```
+
+After draining:
+```c
+h->mvc_base_pic->reference &= ~MVC_IV_REF;
+h->mvc_base_pic = NULL;
+```
+
+### 7l. ff_h264_remove_view_refs (h264_refs.c)
+
+Clear only one view's references during per-view IDR (base view IDR
+must not destroy dep view refs, and vice versa):
+
+```c
+void ff_h264_remove_view_refs(H264Context *h, int view_id)
+{
+    for (int i = h->short_ref_count - 1; i >= 0; i--) {
+        if (h->short_ref[i]->view_id == view_id) {
+            unreference_pic(h, h->short_ref[i], 0);
+            remove_short_at_index(h, i);
+        }
+    }
+    for (int i = 0; i < 16; i++) {
+        if (h->long_ref[i] && h->long_ref[i]->view_id == view_id)
+            remove_long(h, i, 0);
+    }
+}
+```
+
+Called from `ff_h264_execute_ref_pic_marking()` when `picture_idr` for base view.
+For MVC dep view anchor (idr_pic_flag=1, cur_view_id>0), call with cur_view_id.
+
+### 7m. unreference_pic: check both delayed_pic arrays (h264_refs.c)
+
+Must check `delayed_pic_dep[]` in addition to `delayed_pic[]` to
+protect pictures held in the dep view reorder buffer:
+
+```c
+static inline int unreference_pic(H264Context *h, H264Picture *pic, int refmask)
+{
+    ...
+    /* Check both base and dep view reorder buffers */
+    for (int i = 0; h->delayed_pic[i]; i++)
+        if (pic == h->delayed_pic[i])
+            pic->reference |= DELAYED_PIC_REF;
+    for (int i = 0; h->delayed_pic_dep[i]; i++)
+        if (pic == h->delayed_pic_dep[i])
+            pic->reference |= DELAYED_PIC_REF;
+    ...
+}
+```
+
+### 7n. GOP boundary stale dep slice detection (h264_slice.c)
+
+After base view IDR, dep slices from the old GOP may still arrive
+(MPEG-TS PES ordering). Skip them:
+
+```c
+/* In H264Context (h264dec.h): */
+int mvc_base_idr_decoded;  ///< set when base view IDR decoded, cleared when dep anchor seen
+
+/* In decode_nal_units(), IDR_SLICE case: */
+if (!h->cur_view_id)
+    h->mvc_base_idr_decoded = 1;
+
+/* In EXTEN_SLICE handler, after parsing extension header: */
+if (h->mvc_base_idr_decoded && non_idr_flag) {
+    /* Old-GOP dep slice after base IDR -- skip */
+    break;
+}
+if (!non_idr_flag)
+    h->mvc_base_idr_decoded = 0;  /* dep anchor = new GOP */
+```
+
+### 7o. Per-view reorder buffers (h264dec.h, h264dec.c)
+
+Separate reorder state per view prevents cross-view POC drops:
+
+```c
+/* In H264Context (h264dec.h): */
+H264Picture *delayed_pic_dep[H264_MAX_DPB_FRAMES + 2];  ///< dep view reorder
+int last_pocs_dep[H264_MAX_DPB_FRAMES];                  ///< dep view
+int next_outputed_poc_dep;                                ///< dep view
+
+/* In h264_select_output_frame (h264dec.c): */
+int is_dep = cur->view_id && h->mvc_active;
+H264Picture **delayed = is_dep ? h->delayed_pic_dep : h->delayed_pic;
+int *last_pocs        = is_dep ? h->last_pocs_dep   : h->last_pocs;
+int *next_poc         = is_dep ? &h->next_outputed_poc_dep
+                               : &h->next_outputed_poc;
+```
+
+All init/flush/close paths must handle both arrays. EOF drain:
+`h264_flush_delayed_to_fifo()` drains base queue first, then dep queue.
+
+### 7p. pic_as_field for interlaced inter-view ref (h264_refs.c)
+
+For field pictures, adapt the frame reference to the current field's
+parity:
+
+```c
+/**
+ * Convert a frame-level H264Ref to a field reference.
+ * Sets pic_id and reference bits for the requested field.
+ */
+static void pic_as_field(H264Ref *pic, const int parity)
+{
+    /* Adapt reference bits to the requested field parity */
+    ...
+}
+```
+
+Used in `h264_initialise_ref_list()` when adding inter-view reference
+for field pictures (FIELD_PICTURE(h) is true).
 
 ---
 
@@ -1195,14 +1438,34 @@ Needs `#include "libavutil/stereo3d.h"` and define:
 
 ---
 
-## Patch 10/11: avcodec/h264dec: skip dep view for unsupported configs
+## Patch 10/11: avcodec/h264dec: frame threading guard + auto-disable
 
-This is already integrated into the EXTEN_SLICE handler (Patch 7a):
-- Frame threading check
-- Interlaced check
+### 10a. Frame threading auto-disable in h264_decode_init (h264dec.c)
 
-If you want a separate patch, extract just those two `if` blocks from
-the EXTEN_SLICE case. Otherwise fold them into Patch 7.
+When MVC profiles (118=Multiview High, 128=Stereo High) are detected
+in any SPS during init, auto-disable frame threading:
+
+```c
+if (avctx->extradata_size > 0) {
+    /* Check for MVC profiles in SPS -- if found, frame threading
+     * won't work (single-DPB design needs both views in same thread) */
+    for (int i = 0; i < FF_ARRAY_ELEMS(h->ps.sps_list); i++) {
+        const SPS *sps = h->ps.sps_list[i] ?
+                         h->ps.sps_list[i]->data : NULL;
+        if (sps && (sps->profile_idc == 118 || sps->profile_idc == 128)) {
+            avctx->active_thread_type &= ~FF_THREAD_FRAME;
+            break;
+        }
+    }
+}
+```
+
+### 10b. Runtime frame threading guard (in EXTEN_SLICE handler, Patch 7a)
+
+Already integrated into the EXTEN_SLICE handler: if frame threading
+is still active when an EXTEN_SLICE NAL is encountered (e.g., profile
+wasn't detected in extradata), dep view slices are skipped with a
+debug-level log.
 
 ---
 
@@ -1241,17 +1504,33 @@ Must be uploaded to `samples.ffmpeg.org`.
 3. **Accumulate-and-drain**: Dep view packets buffered in PacketList,
    drained after base decode. Fixes MPEG-TS PES ordering.
 
-4. **Inter-view ref**: DPB search for base view picture with matching
-   frame_num, added as extra long-term-like ref.
+4. **Inter-view ref via mvc_base_pic**: `h->mvc_base_pic` pointer
+   (preferred) or DPB scan by frame_num match (fallback). Protected
+   by `MVC_IV_REF` flag to prevent premature unreferencing.
 
-5. **PICT_FRAME override**: Droppable base view frames need
-   `reference = PICT_FRAME` for inter-view ref validation.
+5. **Per-view reorder buffers**: `delayed_pic[]` for base view,
+   `delayed_pic_dep[]` for dep view. Prevents cross-view POC drops
+   in interlaced MVC with interleaved POC sequences.
 
-6. **idr_pic_flag**: Replaces `nal_unit_type == 5` checks. MVC dep view
+6. **Field-aware inter-view ref**: `pic_as_field()` adapts frame
+   references to field parity for interlaced content. `PICT_FRAME`
+   override for frame pictures.
+
+7. **idr_pic_flag**: Replaces `nal_unit_type == 5` checks. MVC dep view
    anchors are IDR (non_idr_flag=0) but use NAL type 20.
 
-7. **picture_idr**: `idr_pic_flag && !cur_view_id`. Prevents dep view
+8. **picture_idr**: `idr_pic_flag && !cur_view_id`. Prevents dep view
    anchor from clearing the DPB (base view picture still needed).
+
+9. **Per-view MMCO_RESET**: Iterates `short_ref[]` backwards with
+   `remove_short_at_index()` directly (view-filtered), not via
+   `find_short()` which can't find cross-view entries.
+
+10. **GOP boundary detection**: `mvc_base_idr_decoded` flag. After
+    base IDR, non-anchor dep slices from the old GOP are skipped.
+
+11. **Per-view sliding window**: `generate_sliding_window_mmcos()`
+    counts only same-view references for the DPB fullness check.
 
 ---
 
@@ -1266,45 +1545,50 @@ Must be uploaded to `samples.ffmpeg.org`.
 | MPEG-TS SSIF lazy linking | Done | Blu-ray 3D SSIF file support |
 | MVC slice decoding | Done | NAL type 20 rewrite to SLICE, full decode |
 | Per-view POC | Done | Independent POC tracking per view |
-| Per-view reference mgmt | Done | DPB filtering by view_id, inter-view refs |
+| Per-view reference mgmt | Done | DPB filtering by view_id, inter-view refs, idc=4/5 |
+| Inter-view ref (mvc_base_pic) | Done | MVC_IV_REF protection, DPB fallback |
+| Per-view reorder buffers | Done | Separate delayed_pic/last_pocs per view |
+| Per-view MMCO_RESET | Done | View-filtered iteration, no infinite loop |
+| Per-view sliding window | Done | Per-view DPB fullness check |
+| GOP boundary detection | Done | mvc_base_idr_decoded stale-slice skip |
 | Output FIFO (receive_frame) | Done | Multi-frame output for multiview |
-| MVC packet reordering | Done | Fixes MPEG-TS PES ordering issues |
+| MVC packet reordering | Done | Accumulate-and-drain for MPEG-TS PES ordering |
+| Interlaced MVC | Done | Per-view reorder + pic_as_field() inter-view ref |
 | view_ids option | Done | User selects which views to decode |
 | AV_FRAME_DATA_VIEW_ID | Done | View ID side data on output frames |
 | Stereo3D side data | Done | AV_STEREO3D_FRAMESEQUENCE with left/right |
+| Frame threading auto-disable | Done | Detects MVC profile 118/128 in SPS |
 | FATE test | Done | 52-frame regression test |
 
 ---
 
 ## Known Limitations
 
-- **Interlaced MVC**: dep view skipped (field-pair ref management needs work)
-- **Frame threading + MVC**: dep view skipped (single-DPB, inter-view ref
-  needs base view decoded in same thread context)
-- **>2 views**: only stereo (2 views) tested; inter-view ref lookup
-  hardcodes view_id=0 as base
-- **idc=5 long-term ref**: logs warning, not implemented (rarely used
-  in stereo MVC content)
-- **MVC in MP4/MKV**: only MPEG-TS tested; MP4/MKV may need container
-  support work
-- **Hardware acceleration**: MVC slices go through software decode path only
+- **Frame threading + MVC**: dep view auto-skipped (single-DPB design
+  needs base view decoded in same thread context; slice threading works)
+- **>2 views**: only stereo (2 views) tested; inter-view ref lookup uses
+  `view_id != cur_view_id` which works for 2 but may need refinement
+- **MVC in MP4/MKV**: only MPEG-TS tested; may need container work
+- **Hardware acceleration**: MVC slices use software decode path only
 - **SSIF**: 1-2 frames lost at stream start (lazy linking timing)
 - **View specifiers** (`-map 0:v:vpos:left`): don't work for MPEG-TS MVC
   because Subset SPS arrives too late; use `-view_ids -1` instead
+- **Non-monotonic DTS**: expected with frame-sequential stereo output
+  (same as HEVC multiview)
+- **Interlaced "Missing reference" warnings**: ~3-24 per stream at GOP
+  boundaries, cosmetic (fallback refs used, output correct)
+- **1 dep frame lost at EOF**: interlaced streams, stays in reorder buffer
 
 ---
 
 ## Future Work
 
-1. **More samples**: test with different containers (MP4, MKV), interlaced
-   content, B-frame heavy streams, >2 views
-2. **Reimplement clean patches**: use this guide to write a clean 11-patch
+1. **Reimplement clean patches**: use this guide to write a clean patch
    series for ffmpeg-devel submission
-3. **MP4/MKV container support**: if samples reveal issues with non-MPEG-TS
+2. **MP4/MKV container support**: if samples reveal issues with non-MPEG-TS
    containers
-4. **Interlaced MVC**: implement field-pair ref management for interlaced
-   MVC streams, if demand and test samples exist
-5. **Hardware acceleration**: extend hwaccel backends for MVC NAL types
+3. **Hardware acceleration**: extend hwaccel backends for MVC NAL types
+4. **>2 views**: extend inter-view ref lookup for multiview (>2)
 
 Note: other stereoscopic 3D formats (frame-packing, side-by-side, top-bottom)
 are already supported by FFmpeg natively and do not require MVC decoding.
@@ -1317,24 +1601,28 @@ bitstreams.
 
 ```bash
 # Build
-make -j$(nproc)
+make -j24
 
 # No regressions
-make fate-h264 -j$(nproc)
+make fate-h264 -j24
 
 # CBS test
-make fate-api-h264-mvc -j$(nproc)
+make fate-api-h264-mvc -j24
 
 # MVC decode test
-make fate-h264-mvc -j$(nproc)
+make fate-h264-mvc -j24
 
-# Manual: both views
-ffmpeg -view_ids -1 -i 00024.MTS -map 0:v -f null - 2>&1 | tail -1
+# Manual: progressive MVC, both views
+ffmpeg -view_ids -1 -i 00024.MTS -map 0:v -f null - 2>&1 | grep 'frame='
 # Expected: 294 frames (147 per view)
 
-# Manual: base view only (default)
-ffmpeg -i 00024.MTS -map 0:v -f null - 2>&1 | tail -1
+# Manual: progressive MVC, base view only (default)
+ffmpeg -i 00024.MTS -map 0:v -f null - 2>&1 | grep 'frame='
 # Expected: 147 frames
+
+# Manual: interlaced MVC, both views
+ffmpeg -view_ids -1 -i 999.MTS -map 0:v -f null - 2>&1 | grep 'frame='
+# Expected: 77 frames (both views)
 
 # Manual: view ID side data
 ffprobe -show_frames -show_entries frame=view_id 00024.MTS 2>/dev/null | head -20

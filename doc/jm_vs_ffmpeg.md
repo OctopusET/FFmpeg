@@ -12,9 +12,9 @@ The gaps are in Extended profile tools and Annex G/H extensions:
 
 | Feature | FFmpeg Status | Real-world Impact | Priority |
 |---------|--------------|-------------------|----------|
-| **MVC idc=5 (inter-view long-term ref)** | NOT supported | Blu-ray 3D (blocks decoding) | **CRITICAL** |
-| **MVC interlaced (MBAFF+MVC)** | NOT supported | Some Blu-ray 3D content | HIGH |
-| **MVC frame threading** | Disabled | Performance for MVC | MEDIUM |
+| ~~MVC idc=5 (inter-view long-term ref)~~ | **Done** | Blu-ray 3D | ~~CRITICAL~~ |
+| ~~MVC interlaced (MBAFF+MVC)~~ | **Done** | Blu-ray 3D | ~~HIGH~~ |
+| **MVC frame threading** | Disabled (auto-detect) | Performance for MVC | MEDIUM |
 | **MVC >2 views** | NOT supported | Research/niche | LOW |
 | **MVC SEI messages (types 37-54)** | NOT supported | Metadata only | LOW |
 | FMO (Flexible Macroblock Ordering) | NOT supported | Legacy mobile streams | LOW |
@@ -38,51 +38,39 @@ The gaps are in Extended profile tools and Annex G/H extensions:
 | NAL type 14 (PREFIX) -- no-op | Done |
 | NAL type 15 (Subset SPS) -- base SPS + view_id extraction | Done |
 | Inter-view prediction via idc=4 (short-term ref) | Done |
+| Inter-view prediction via idc=5 (long-term ref) | Done |
+| mvc_base_pic with MVC_IV_REF protection | Done |
 | Per-view DPB management (view_id filtering) | Done |
 | Per-view POC tracking (dep_view_poc) | Done |
+| Per-view reorder buffers (delayed_pic_dep) | Done |
+| Per-view MMCO_RESET (view-filtered iteration) | Done |
+| Per-view sliding window + DPB overflow check | Done |
+| GOP boundary detection (mvc_base_idr_decoded) | Done |
+| Interlaced MVC (MBAFF + pic_as_field) | Done |
 | MPEG-TS PID merging (stream_type 0x20) | Done |
 | MPEG-TS SSIF lazy linking | Done |
 | MVC packet reordering (accumulate-and-drain) | Done |
 | Output FIFO (receive_frame, multi-frame) | Done |
 | view_ids option + AV_FRAME_DATA_VIEW_ID | Done |
 | Stereo3D side data (AV_STEREO3D_FRAMESEQUENCE) | Done |
+| Frame threading auto-disable (profile 118/128) | Done |
 | FATE test | Done |
 
 ### What's missing
 
-#### 1a. idc=5: Inter-view long-term ref list modification (CRITICAL)
+#### 1a. idc=5: Inter-view long-term ref list modification -- DONE
 
-**What it is:** H.264 Annex H, modification_of_pic_nums_idc=5. Inserts an
-inter-view reference picture (from the base view, same access unit) into
-the reference list as a long-term-style reference.
+**Implemented.** Uses `mvc_base_pic` pointer (preferred) or DPB scan (fallback)
+to find the inter-view reference. `pic_structure` initialized from
+`h->picture_structure` for correct field handling. Works with both progressive
+and interlaced MVC content.
 
-**Why it matters:** Real Blu-ray 3D content (our test ISO, encoded by
-CyberLink) uses idc=5 on EVERY dependent view slice. Without it, no
-dependent view frames decode correctly.
+#### 1b. Interlaced MVC -- DONE
 
-**Current code:** `libavcodec/h264_refs.c:443-448` -- logs warning, sets
-`i = -1`, triggers "reference picture missing during reorder".
-
-**How to fix:** Implement case 5 analogous to case 4 (lines 427-441):
-- case 4: searches `short_ref[]` for different view_id, same frame_num
-- case 5: should search the DPB or ref list for the inter-view picture
-  (already appended by `h264_initialise_ref_list`), same matching criteria
-  (different view_id, same frame_num), but following long-term ref semantics
-
-**Reference pattern from real Blu-ray 3D stream:**
-```
-Anchor P-slices:  [idc=5(abs_diff_view_idx=0), idc=3(end)]
-Non-anchor slices: [idc=0(abs_diff_pic_num), idc=5(abs_diff_view_idx=0), idc=3(end)]
-```
-
-Note: idc=4 is NEVER used in this sample. Some encoders prefer idc=5.
-
-#### 1b. Interlaced MVC (HIGH priority)
-
-Currently rejected at `h264dec.c:906-911`. Would need:
-- MBAFF-aware inter-view ref handling
-- Field-pair reference management across views
-- Testing with interlaced MVC samples
+**Implemented.** Per-view reorder buffers (`delayed_pic_dep[]`, `last_pocs_dep[]`,
+`next_outputed_poc_dep`) prevent cross-view POC drops. `pic_as_field()` adapts
+inter-view references for field pictures. Tested with 999.MTS, 00001.MTS,
+00001-2.MTS, 00002.MTS (interlaced HDMV samples).
 
 #### 1c. Frame threading + MVC (MEDIUM priority)
 
