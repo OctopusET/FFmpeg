@@ -704,11 +704,15 @@ static int h264_register_view_id(H264Context *h, int view_id)
     ids = av_realloc_array(h->view_ids_available, n + 1, sizeof(*ids));
     if (!ids)
         return AVERROR(ENOMEM);
-    h->view_ids_available = ids;
 
     pos = av_realloc_array(h->view_pos_available, n + 1, sizeof(*pos));
-    if (!pos)
+    if (!pos) {
+        /* ids was already reallocated; assign it so it's not leaked.
+         * The extra slot is unused but harmless (nb stays the same). */
+        h->view_ids_available = ids;
         return AVERROR(ENOMEM);
+    }
+    h->view_ids_available = ids;
     h->view_pos_available = pos;
 
     h->view_ids_available[n] = view_id;
@@ -901,7 +905,10 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
 
                 skip_bits(&tmp_gb, 1);  /* bit_equal_to_one */
                 num_views = get_ue_golomb_long(&tmp_gb) + 1;
-                if (num_views > 0 && num_views <= 1024 &&
+                /* H.264 Annex H limits num_views_minus1.  CBS uses
+                 * H264_MVC_MAX_VIEWS (2); allow a few more for
+                 * future use but reject obviously corrupt values. */
+                if (num_views > 0 && num_views <= 16 &&
                     get_bits_left(&tmp_gb) >= 0) {
                     if (!h->mvc_active)
                         h->mvc_active = 1;
@@ -1656,7 +1663,7 @@ static const AVOption h264_options[] = {
         "Array of view IDs that should be decoded and output; "
         "a single -1 to decode all views (MVC multiview)",
         .offset = OFFSET(view_ids), .type = AV_OPT_TYPE_INT | AV_OPT_TYPE_FLAG_ARRAY,
-        .min = -1, .max = INT_MAX, .flags = VD },
+        .min = -1, .max = 1023, .flags = VD },
     { "view_ids_available",
         "Array of available view IDs is exported here (MVC multiview)",
         .offset = OFFSET(view_ids_available),
