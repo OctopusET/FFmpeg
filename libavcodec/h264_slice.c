@@ -426,9 +426,12 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
     memcpy(h->long_ref,    h1->long_ref,    sizeof(h->long_ref));
     memcpy(h->delayed_pic, h1->delayed_pic, sizeof(h->delayed_pic));
     memcpy(h->last_pocs,   h1->last_pocs,   sizeof(h->last_pocs));
+    memcpy(h->delayed_pic_dep, h1->delayed_pic_dep, sizeof(h->delayed_pic_dep));
+    memcpy(h->last_pocs_dep,   h1->last_pocs_dep,   sizeof(h->last_pocs_dep));
 
     h->next_output_pic   = h1->next_output_pic;
     h->next_outputed_poc = h1->next_outputed_poc;
+    h->next_outputed_poc_dep = h1->next_outputed_poc_dep;
     h->poc_offset        = h1->poc_offset;
 
     memcpy(h->mmco, h1->mmco, sizeof(h->mmco));
@@ -446,6 +449,8 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
     copy_picture_range(h->long_ref, h1->long_ref, 32, h, h1);
     copy_picture_range(h->delayed_pic, h1->delayed_pic,
                        FF_ARRAY_ELEMS(h->delayed_pic), h, h1);
+    copy_picture_range(h->delayed_pic_dep, h1->delayed_pic_dep,
+                       FF_ARRAY_ELEMS(h->delayed_pic_dep), h, h1);
 
     h->frame_recovered       = h1->frame_recovered;
 
