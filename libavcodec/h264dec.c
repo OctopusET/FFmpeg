@@ -1570,10 +1570,18 @@ get_packet:
      * packet data to classify dep-view-only packets.
      * !is_frame_mt: frame threading gives each worker one packet, so the
      * accumulate-and-drain pattern doesn't work (dep view slices are
-     * skipped by the EXTEN_SLICE handler instead). */
-    if (h->mvc_active && !h->is_avc &&
-        !avctx->internal->is_frame_mt &&
+     * skipped by the EXTEN_SLICE handler instead).
+     *
+     * Note: do NOT gate on mvc_active here.  The first dep view PES in
+     * MPEG-TS arrives before any EXTEN_SLICE has been decoded (which is
+     * what sets mvc_active).  Detecting it early prevents "Missing
+     * reference picture" errors and the loss of the first dep frame.
+     * h264_is_dep_view_packet() returns 0 immediately for non-MVC
+     * packets (finds SLICE at the first NAL), so the cost is negligible. */
+    if (!h->is_avc && !avctx->internal->is_frame_mt &&
         h264_is_dep_view_packet(avpkt->data, avpkt->size)) {
+        if (!h->mvc_active)
+            h->mvc_active = 1;
         ret = avpriv_packet_list_put(&h->mvc_pending_pkts, avpkt, NULL, 0);
         if (ret < 0)
             return ret;
