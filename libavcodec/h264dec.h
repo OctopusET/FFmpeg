@@ -601,6 +601,41 @@ typedef struct H264Context {
     int noref_gray;
     int skip_gray;
 
+    /**
+     * @name MVC (Multiview Video Coding) state -- H.264 Annex H
+     *
+     * Architecture: single-DPB with view_id tagging.
+     *
+     * Both views share DPB[36] and short_ref[]/long_ref[] arrays.
+     * Each H264Picture is tagged with view_id so ref list construction
+     * (h264_refs.c) filters by view_id before building lists.
+     * Inter-view references are added explicitly from the base view
+     * picture with matching frame_num (see h264_initialise_ref_list()).
+     *
+     * POC state (prev_poc_msb/lsb, frame_num, etc.) is tracked per-view
+     * via H264Context.poc (base) and H264Context.dep_view_poc (dependent).
+     * Selected with: h->cur_view_id ? &h->dep_view_poc : &h->poc.
+     *
+     * Output uses per-view reorder buffers (delayed_pic[] for base,
+     * delayed_pic_dep[] for dependent) so B-frame POC ordering within
+     * each view is independent.
+     *
+     * MPEG-TS demuxing: mpegts.c merges the dependent view PID
+     * (stream_type 0x20) onto the base H.264 stream (0x1B), so the
+     * decoder sees both views' NALs on a single AVStream.
+     *
+     * Packet reordering: MPEG-TS PES ordering often delivers dep view
+     * packets before the base view packet for the same access unit.
+     * h264_receive_frame() accumulates dep-view-only packets in
+     * mvc_pending_pkts and drains them after the base view packet,
+     * ensuring the inter-view reference picture is in the DPB.
+     *
+     * Threading: MVC requires single-thread or slice-thread mode.
+     * Frame threading is incompatible because each worker has a
+     * separate DPB, preventing inter-view prediction.
+     *
+     * @{
+     */
     int cur_view_id;        ///< MVC view_id of current NAL (0=base)
     int idr_pic_flag;       ///< IdrPicFlag: nal_type==5 or MVC !non_idr_flag
 
@@ -624,6 +659,7 @@ typedef struct H264Context {
     unsigned nb_view_ids_available;
     unsigned *view_pos_available;   ///< view positions for view_ids_available
     unsigned nb_view_pos_available;
+    /** @} */
 } H264Context;
 
 extern const uint16_t ff_h264_mb_sizes[4];
@@ -642,6 +678,14 @@ int ff_h264_alloc_tables(H264Context *h);
 int ff_h264_decode_ref_pic_list_reordering(H264SliceContext *sl, void *logctx);
 int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl);
 void ff_h264_remove_all_refs(H264Context *h);
+
+/**
+ * Remove all reference pictures belonging to a specific MVC view.
+ *
+ * Used by idr() in MVC mode: when a base view IDR arrives, only the
+ * base view refs should be cleared (the dep view's refs from a prior
+ * GOP are handled separately).  Also used for dep view anchors.
+ */
 void ff_h264_remove_view_refs(H264Context *h, int view_id);
 
 /**

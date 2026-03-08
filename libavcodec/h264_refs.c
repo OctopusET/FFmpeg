@@ -528,6 +528,9 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
     for (int list = 0; list < sl->list_count; list++) {
         for (int index = 0; index < sl->ref_count[list]; index++) {
             int ref = sl->ref_list[list][index].reference;
+            /* MVC inter-view refs may have reference=MVC_IV_REF without
+             * TOP|BOTTOM bits set (droppable base frames).  Skip the
+             * (ref & 3) != 3 check for these. */
             if (   !sl->ref_list[list][index].parent
                 || (!FIELD_PICTURE(h) && !(ref & MVC_IV_REF) && (ref & 3) != 3)) {
                 if (h->avctx->err_recognition & AV_EF_EXPLODE) {
@@ -538,6 +541,10 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                        "Missing reference picture, default is %d\n",
                        h->default_ref[list].poc);
 
+                /* MVC: reset per-view reorder state, not both views.
+                 * The missing ref only affects the current view's POC
+                 * ordering.  Resetting the other view's last_pocs would
+                 * cause spurious "Invalid POC" warnings. */
                 {
                     int *lp = h->cur_view_id ? h->last_pocs_dep : h->last_pocs;
                     for (int i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++)

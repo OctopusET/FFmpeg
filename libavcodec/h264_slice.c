@@ -1311,6 +1311,14 @@ static int h264_export_frame_props(H264Context *h)
     return 0;
 }
 
+/**
+ * Select the next frame to output from the reorder buffer.
+ *
+ * Manages the delayed picture buffer for POC-order output.
+ * For MVC, base and dependent views use separate reorder buffers
+ * (delayed_pic[] / delayed_pic_dep[]) so each view's B-frame
+ * reordering is independent.
+ */
 static int h264_select_output_frame(H264Context *h)
 {
     const SPS *sps = h->ps.sps;
@@ -1548,6 +1556,8 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
         av_log(h->avctx, AV_LOG_DEBUG, "Frame num gap %d %d\n",
                poc->frame_num, poc->prev_frame_num);
         if (!sps->gaps_in_frame_num_allowed_flag) {
+            /* MVC: reset reorder state for current view only;
+             * the other view's POC ordering is unaffected. */
             int *last_pocs = h->cur_view_id ? h->last_pocs_dep : h->last_pocs;
             for (i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++)
                 last_pocs[i] = INT_MIN;
