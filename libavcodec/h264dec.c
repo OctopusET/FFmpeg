@@ -521,10 +521,11 @@ void ff_h264_flush_change(H264Context *h)
     /* Flush must remove ALL refs regardless of cur_view_id.
      * idr() in MVC mode only removes one view's refs, so
      * temporarily disable mvc_active for the flush. */
-    { int save_mvc = h->mvc_active;
-      h->mvc_active = 0;
-      idr(h);
-      h->mvc_active = save_mvc;
+    {
+        int save_mvc = h->mvc_active;
+        h->mvc_active = 0;
+        idr(h);
+        h->mvc_active = save_mvc;
     }
 
     h->poc.prev_frame_num = -1;
