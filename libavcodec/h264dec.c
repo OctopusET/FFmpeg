@@ -376,6 +376,7 @@ static av_cold int h264_decode_end(AVCodecContext *avctx)
     av_refstruct_pool_uninit(&h->decode_error_flags_pool);
     av_container_fifo_free(&h->output_fifo);
     avpriv_packet_list_free(&h->mvc_pending_pkts);
+    h->mvc_pending_count = 0;
     av_freep(&h->view_ids_available);
     av_freep(&h->view_pos_available);
 
@@ -560,6 +561,7 @@ static av_cold void h264_decode_flush(AVCodecContext *avctx)
     av_container_fifo_drain(h->output_fifo,
                             av_container_fifo_can_read(h->output_fifo));
     avpriv_packet_list_free(&h->mvc_pending_pkts);
+    h->mvc_pending_count = 0;
     memset(h->delayed_pic, 0, sizeof(h->delayed_pic));
     memset(h->delayed_pic_dep, 0, sizeof(h->delayed_pic_dep));
 
@@ -701,6 +703,9 @@ static int h264_register_view_id(H264Context *h, int view_id)
     for (unsigned i = 0; i < n; i++)
         if (h->view_ids_available[i] == (unsigned)view_id)
             return 0;
+
+    if (n >= 1024)
+        return AVERROR_INVALIDDATA;
 
     ids = av_realloc_array(h->view_ids_available, n + 1, sizeof(*ids));
     if (!ids)
@@ -1516,9 +1521,11 @@ static int h264_drain_mvc_pending(H264Context *h)
         av_packet_unref(pkt);
         if (ret < 0) {
             avpriv_packet_list_free(&h->mvc_pending_pkts);
+            h->mvc_pending_count = 0;
             break;
         }
     }
+    h->mvc_pending_count = 0;
     av_packet_free(&pkt);
     return ret;
 }
@@ -1590,9 +1597,19 @@ get_packet:
         h264_is_dep_view_packet(avpkt->data, avpkt->size)) {
         if (!h->mvc_active)
             h->mvc_active = 1;
+        /* Cap pending list to avoid unbounded growth from a corrupt stream
+         * that never sends base view packets. */
+        if (h->mvc_pending_count >= H264_MAX_DPB_FRAMES) {
+            avpriv_packet_list_free(&h->mvc_pending_pkts);
+            h->mvc_pending_count = 0;
+            av_log(avctx, AV_LOG_ERROR,
+                   "MVC: too many dep view packets without base view\n");
+            return AVERROR_INVALIDDATA;
+        }
         ret = avpriv_packet_list_put(&h->mvc_pending_pkts, avpkt, NULL, 0);
         if (ret < 0)
             return ret;
+        h->mvc_pending_count++;
         goto get_packet;
     }
 

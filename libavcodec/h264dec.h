@@ -616,6 +616,7 @@ typedef struct H264Context {
      * drained after the base view packet is decoded.
      */
     PacketList mvc_pending_pkts;
+    int mvc_pending_count;          ///< number of packets in mvc_pending_pkts
 
     int *view_ids;                  ///< user-requested view IDs (AVOption, -1=all)
     unsigned nb_view_ids;

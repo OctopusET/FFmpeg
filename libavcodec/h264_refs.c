@@ -538,8 +538,11 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                        "Missing reference picture, default is %d\n",
                        h->default_ref[list].poc);
 
-                for (int i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++)
-                    h->last_pocs[i] = INT_MIN;
+                {
+                    int *lp = h->cur_view_id ? h->last_pocs_dep : h->last_pocs;
+                    for (int i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++)
+                        lp[i] = INT_MIN;
+                }
                 if (h->default_ref[list].parent
                     && !(!FIELD_PICTURE(h) && (h->default_ref[list].reference&3) != 3))
                     sl->ref_list[list][index] = h->default_ref[list];
