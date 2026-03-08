@@ -540,6 +540,12 @@ static int vaapi_decode_make_config(AVCodecContext *avctx,
                      vaapi_profile_map[i].va_profile;
         codec_profile = vaapi_profile_map[i].codec_profile;
 
+        /* A profile_parser returning VAProfileNone means "skip this
+         * entry".  Don't match it against the driver's profile list
+         * because VAProfileNone may be listed (for VideoProc). */
+        if (vaapi_profile_map[i].profile_parser && va_profile == VAProfileNone)
+            continue;
+
         for (j = 0; j < profile_count; j++) {
             if (va_profile == profile_list[j]) {
                 exact_match = profile_match;
