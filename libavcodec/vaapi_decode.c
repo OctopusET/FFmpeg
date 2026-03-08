@@ -433,8 +433,8 @@ static const struct {
     /* MVC: avctx->profile is H264_HIGH (from base SPS) even for MVC
      * streams.  Place this before H264_HIGH so MVC streams get the
      * Stereo/Multiview profile when the driver supports it.  The
-     * parser returns VAProfileNone for non-MVC, causing the entry
-     * to be skipped (VAProfileNone won't be in the driver's list). */
+     * parser returns VAProfileNone for non-MVC, which is skipped
+     * by the VAProfileNone continue check in vaapi_decode_make_config. */
     MAP(H264,        H264_HIGH,       None,
                  ff_vaapi_parse_h264_mvc_profile ),
 #endif
