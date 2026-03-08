@@ -24,6 +24,7 @@
 #include "h264_ps.h"
 #include "hwaccel_internal.h"
 #include "vaapi_decode.h"
+#include "vaapi_h264.h"
 
 /**
  * @file
@@ -281,7 +282,7 @@ static int vaapi_h264_start_frame(AVCodecContext          *avctx,
             .redundant_pic_cnt_present_flag         = pps->redundant_pic_cnt_present,
             .reference_pic_flag                     = h->nal_ref_idc != 0,
         },
-        .frame_num                                  = h->poc.frame_num,
+        .frame_num                                  = h->cur_pic_ptr->frame_num,
     };
 
     fill_vaapi_pic(&pic_param.CurrPic, h->cur_pic_ptr, h->picture_structure);
@@ -392,6 +393,41 @@ static int vaapi_h264_decode_slice(AVCodecContext *avctx,
     }
 
     return 0;
+}
+
+/**
+ * Select the correct VA-API profile for MVC streams.
+ *
+ * MVC (Multiview Video Coding) uses profile_idc 118 (Multiview High) or
+ * 128 (Stereo High).  The base view SPS has profile_idc=100 (High), so
+ * avctx->profile is typically AV_PROFILE_H264_HIGH.  However, the VA-API
+ * driver needs VAProfileH264StereoHigh or VAProfileH264MultiviewHigh to
+ * enable inter-view prediction in hardware.
+ *
+ * When mvc_active is set, check the Subset SPS profile to select the
+ * correct MVC VA profile.  Fall back to VAProfileH264StereoHigh (most
+ * common for Blu-ray 3D) if no Subset SPS is available.
+ */
+VAProfile ff_vaapi_parse_h264_mvc_profile(AVCodecContext *avctx)
+{
+    const H264Context *h = avctx->priv_data;
+
+    if (!h->mvc_active)
+        return VAProfileNone;
+
+    /* Check Subset SPS profile_idc to distinguish Multiview High
+     * (118) from Stereo High (128). */
+    for (int i = 0; i < MAX_SPS_COUNT; i++) {
+        if (h->ps.sps_list[i]) {
+            int profile_idc = h->ps.sps_list[i]->profile_idc;
+            if (profile_idc == 118)
+                return VAProfileH264MultiviewHigh;
+            if (profile_idc == 128)
+                return VAProfileH264StereoHigh;
+        }
+    }
+    /* No Subset SPS found yet; default to Stereo High (Blu-ray 3D) */
+    return VAProfileH264StereoHigh;
 }
 
 const FFHWAccel ff_h264_vaapi_hwaccel = {

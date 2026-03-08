@@ -28,6 +28,7 @@
 #include "decode.h"
 #include "internal.h"
 #include "vaapi_decode.h"
+#include "vaapi_h264.h"
 #include "vaapi_hevc.h"
 
 
@@ -428,6 +429,15 @@ static const struct {
     MAP(H264,        H264_CONSTRAINED_BASELINE,
                            H264ConstrainedBaseline),
     MAP(H264,        H264_MAIN,       H264Main    ),
+#if CONFIG_H264_VAAPI_HWACCEL
+    /* MVC: avctx->profile is H264_HIGH (from base SPS) even for MVC
+     * streams.  Place this before H264_HIGH so MVC streams get the
+     * Stereo/Multiview profile when the driver supports it.  The
+     * parser returns VAProfileNone for non-MVC, causing the entry
+     * to be skipped (VAProfileNone won't be in the driver's list). */
+    MAP(H264,        H264_HIGH,       None,
+                 ff_vaapi_parse_h264_mvc_profile ),
+#endif
     MAP(H264,        H264_HIGH,       H264High    ),
 #if VA_CHECK_VERSION(0, 37, 0)
     MAP(HEVC,        HEVC_MAIN,       HEVCMain    ),
