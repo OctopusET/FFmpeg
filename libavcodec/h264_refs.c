@@ -489,7 +489,8 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
             }
 
             if (i < 0 || mismatches_ref(h, ref)) {
-                av_log(h->avctx, AV_LOG_ERROR,
+                av_log(h->avctx,
+                       h->cur_view_id && h->mvc_active ? AV_LOG_DEBUG : AV_LOG_ERROR,
                        i < 0 ? "reference picture missing during reorder\n" :
                                "mismatching reference\n");
                 if (h->cur_view_id) {
@@ -537,7 +538,11 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                     av_log(h->avctx, AV_LOG_ERROR, "Missing reference picture\n");
                     return AVERROR_INVALIDDATA;
                 }
-                av_log(h->avctx, AV_LOG_ERROR,
+                /* MVC dep view: missing temporal refs are common when
+                 * the dep view uses only B-slices with limited DPB.
+                 * Log at debug level to avoid flooding. */
+                av_log(h->avctx,
+                       h->cur_view_id && h->mvc_active ? AV_LOG_DEBUG : AV_LOG_ERROR,
                        "Missing reference picture, default is %d\n",
                        h->default_ref[list].poc);
 

@@ -589,6 +589,14 @@ static int h264_frame_start(H264Context *h)
 
     h->cur_pic_ptr->field_poc[0] = h->cur_pic_ptr->field_poc[1] = INT_MAX;
 
+    /* MVC: save pending output before clearing.  When a view transition
+     * triggers h264_frame_start for the dep view, the base view's
+     * next_output_pic (set by h264_select_output_frame during the base
+     * second field) would be lost.  Save it for decode_nal_units. */
+    if (h->is_avc && h->mvc_active && h->next_output_pic && !h->mvc_pending_output_pic) {
+        h->next_output_pic->recovered |= h->frame_recovered;
+        h->mvc_pending_output_pic = h->next_output_pic;
+    }
     h->next_output_pic = NULL;
 
     h->postpone_filter = 0;
@@ -1805,6 +1813,12 @@ static int h264_slice_header_parse(const H264Context *h, H264SliceContext *sl,
     if (!first_slice) {
         const H264POCContext *poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
         if (poc->frame_num != sl->frame_num) {
+            /* MVC: frame_num mismatch is expected at a view transition
+             * (new picture, different view).  Return error silently --
+             * the caller detects the view change and re-parses. */
+            if (h->mvc_active && h->cur_pic_ptr &&
+                h->cur_pic_ptr->view_id != h->cur_view_id)
+                return AVERROR_INVALIDDATA;
             av_log(h->avctx, AV_LOG_ERROR, "Frame num change from %d to %d\n",
                    poc->frame_num, sl->frame_num);
             return AVERROR_INVALIDDATA;
@@ -2127,8 +2141,17 @@ int ff_h264_queue_decode_slice(H264Context *h, const H2645NAL *nal)
     sl->gb = nal->gb;
 
     ret = h264_slice_header_parse(h, sl, nal);
-    if (ret < 0)
+    if (ret < 0) {
+        /* MVC: slice header parse may fail when switching views because
+         * the dep view uses a different PPS.  If we have a current picture
+         * from a different view, this is a view transition -- handle it
+         * below instead of returning the error immediately. */
+        if (h->mvc_active && h->cur_pic_ptr &&
+            h->cur_pic_ptr->view_id != h->cur_view_id &&
+            sl->first_mb_addr == 0)
+            goto mvc_view_transition;
         return ret;
+    }
 
     // discard redundant pictures
     if (sl->redundant_pic_count > 0) {
@@ -2136,6 +2159,7 @@ int ff_h264_queue_decode_slice(H264Context *h, const H2645NAL *nal)
         return 0;
     }
 
+mvc_view_transition:
     if (sl->first_mb_addr == 0 || !h->current_slice) {
         if (h->setup_finished) {
             av_log(h->avctx, AV_LOG_ERROR, "Too many fields\n");
@@ -2160,21 +2184,65 @@ int ff_h264_queue_decode_slice(H264Context *h, const H2645NAL *nal)
                 sl = h->slice_ctx;
             }
 
-            if (h->cur_pic_ptr && FIELD_PICTURE(h) && h->first_field) {
+            if (h->cur_pic_ptr && FIELD_PICTURE(h) && h->first_field &&
+                h->cur_pic_ptr->view_id == h->cur_view_id) {
+                /* First->second field of same view */
                 ret = ff_h264_field_end(h, h->slice_ctx, 1);
                 if (ret < 0)
                     return ret;
-            } else if (h->cur_pic_ptr && !FIELD_PICTURE(h) && !h->first_field &&
+            } else if (h->cur_pic_ptr && !h->first_field &&
                        (h->idr_pic_flag ||
                         h->cur_pic_ptr->view_id != h->cur_view_id)) {
-                /* Broken frame packetizing or MVC view transition */
-                if (h->cur_pic_ptr->view_id == h->cur_view_id)
+                /* MVC view transition or broken frame packetizing.
+                 * For interlaced MVC, this handles the transition after
+                 * both fields of the base view are complete and a dep
+                 * view slice arrives (FIELD_PICTURE, first_field=0,
+                 * view_id changed). */
+                if (h->cur_pic_ptr->view_id == h->cur_view_id &&
+                    !FIELD_PICTURE(h))
                     av_log(h->avctx, AV_LOG_WARNING, "Broken frame packetizing\n");
-                ret = ff_h264_field_end(h, h->slice_ctx,
-                                        !(h->avctx->active_thread_type & FF_THREAD_FRAME));
+                /* Temporarily restore cur_view_id and idr_pic_flag to the
+                 * outgoing view for field_end.  cur_view_id ensures sliding
+                 * window counts the correct view's refs.  idr_pic_flag must
+                 * reflect the base view (not the incoming dep view's IDR). */
+                {
+                    int save_view = h->cur_view_id;
+                    int save_idr  = h->idr_pic_flag;
+                    h->cur_view_id = h->cur_pic_ptr->view_id;
+                    h->idr_pic_flag = 0; /* base view is not IDR here */
+                    ret = ff_h264_field_end(h, h->slice_ctx,
+                                            !(h->avctx->active_thread_type & FF_THREAD_FRAME));
+                    h->cur_view_id = save_view;
+                    h->idr_pic_flag = save_idr;
+                }
                 ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX, 0);
                 ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX, 1);
+                /* MVC base->dep transition: save base picture as inter-view
+                 * reference before clearing cur_pic_ptr.  In MPEG-TS this
+                 * is done in h264_receive_frame; in MP4 both views are in
+                 * the same packet so we do it here. */
+                if (h->mvc_active && h->cur_pic_ptr->view_id == 0 &&
+                    h->cur_view_id != 0) {
+                    if (h->mvc_base_pic)
+                        h->mvc_base_pic->reference &= ~MVC_IV_REF;
+                    h->mvc_base_pic = h->cur_pic_ptr;
+                    h->cur_pic_ptr->reference |= MVC_IV_REF;
+                } else if (h->mvc_active && h->mvc_base_pic) {
+                    h->mvc_base_pic->reference &= ~MVC_IV_REF;
+                    h->mvc_base_pic = NULL;
+                }
                 h->cur_pic_ptr = NULL;
+                /* MVC view transition: reset slice state so the new view
+                 * starts fresh (first_slice=1, new picture allocation).
+                 * Re-parse slice header since PPS may differ per view. */
+                if (h->mvc_active && h->cur_pic_ptr == NULL) {
+                    h->current_slice = 0;
+                    first_slice = 1;
+                    sl->gb = nal->gb;
+                    ret = h264_slice_header_parse(h, sl, nal);
+                    if (ret < 0)
+                        return ret;
+                }
                 if (ret < 0)
                     return ret;
             } else

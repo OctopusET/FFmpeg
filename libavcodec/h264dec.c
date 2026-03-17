@@ -730,6 +730,8 @@ static int h264_register_view_id(H264Context *h, int view_id)
     return 0;
 }
 
+static int finalize_frame(H264Context *h, H264Picture *out);
+
 static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                             const uint8_t *buf, int buf_size)
 {
@@ -769,7 +771,38 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
     if (nals_needed < 0)
         return nals_needed;
 
-    for (i = 0; i < h->pkt.nb_nals; i++) {
+    /* MVC in AVC (MP4): reorder NALs so base view comes before dep view.
+     * Some containers (e.g. JVC 3D cameras) interleave base and dep view
+     * NALs at the field level within a single sample.  The decoder needs
+     * all base view fields decoded before dep view starts (for inter-view
+     * reference).  Build an index array: non-EXTEN_SLICE first, then
+     * EXTEN_SLICE.  For non-MVC or MPEG-TS, this is a no-op (no type 20). */
+    int nal_order_buf[128];
+    int *nal_order = nal_order_buf;
+    int nb_nal_order = h->pkt.nb_nals;
+    if (h->pkt.nb_nals > 128) {
+        nal_order = av_malloc_array(h->pkt.nb_nals, sizeof(*nal_order));
+        if (!nal_order)
+            return AVERROR(ENOMEM);
+    }
+    {
+        int base_idx = 0, dep_idx = 0;
+        /* Count non-EXTEN_SLICE NALs to find where dep NALs start */
+        for (i = 0; i < h->pkt.nb_nals; i++)
+            if (h->pkt.nals[i].type != H264_NAL_EXTEN_SLICE)
+                base_idx++;
+        dep_idx = base_idx;
+        base_idx = 0;
+        for (i = 0; i < h->pkt.nb_nals; i++) {
+            if (h->pkt.nals[i].type != H264_NAL_EXTEN_SLICE)
+                nal_order[base_idx++] = i;
+            else
+                nal_order[dep_idx++] = i;
+        }
+    }
+
+    for (int nal_idx = 0; nal_idx < nb_nal_order; nal_idx++) {
+        i = nal_order[nal_idx];
         H2645NAL *nal = &h->pkt.nals[i];
         int max_slice_ctx, err;
 
@@ -806,6 +839,17 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                 H264SliceContext *sl = h->slice_ctx + h->nb_slice_ctx_queued;
                 sl->ref_count[0] = sl->ref_count[1] = 0;
                 break;
+            }
+
+            /* MVC: output base view frames saved during view transition.
+             * h264_frame_start clears next_output_pic, so the base view
+             * output is saved in mvc_pending_output_pic instead. */
+            if (h->mvc_active && h->cur_view_id != 0 &&
+                h->mvc_pending_output_pic) {
+                ret = finalize_frame(h, h->mvc_pending_output_pic);
+                h->mvc_pending_output_pic = NULL;
+                if (ret < 0)
+                    goto end;
             }
 
             if (h->current_slice == 1) {
@@ -1046,6 +1090,8 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
 
     ret = 0;
 end:
+    if (nal_order != nal_order_buf)
+        av_free(nal_order);
 
 #if CONFIG_ERROR_RESILIENCE
     /*

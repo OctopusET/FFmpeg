@@ -652,6 +652,7 @@ typedef struct H264Context {
      */
     PacketList mvc_pending_pkts;
     int mvc_pending_count;          ///< number of packets in mvc_pending_pkts
+    H264Picture *mvc_pending_output_pic; ///< base view output saved across view transition
 
     int *view_ids;                  ///< user-requested view IDs (AVOption, -1=all)
     unsigned nb_view_ids;
