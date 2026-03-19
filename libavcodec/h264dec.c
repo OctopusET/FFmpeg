@@ -801,6 +801,8 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
         }
     }
 
+    int in_dep_section = 0;
+
     for (int nal_idx = 0; nal_idx < nb_nal_order; nal_idx++) {
         i = nal_order[nal_idx];
         H2645NAL *nal = &h->pkt.nals[i];
@@ -808,6 +810,15 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
 
         if (avctx->skip_frame >= AVDISCARD_NONREF &&
             nal->ref_idc == 0 && nal->type != H264_NAL_SEI)
+            continue;
+
+        /* Track dep section of combined MVC packets.  Skip dep NALs
+         * when the user only wants the base view to prevent dep
+         * parameter sets from polluting base view tables. */
+        if (nal->type == H264_NAL_SUB_SPS || nal->type == H264_NAL_PREFIX)
+            in_dep_section = 1;
+        if (in_dep_section && !h->nb_view_ids &&
+            nal->type != H264_NAL_EXTEN_SLICE)
             continue;
 
         // FIXME these should stop being context-global variables
@@ -960,8 +971,8 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                  * future use but reject obviously corrupt values. */
                 if (num_views > 0 && num_views <= 16 &&
                     get_bits_left(&tmp_gb) >= 0) {
-                    if (!h->mvc_active)
-                        h->mvc_active = 1;
+                    if (!h->mvc_detected)
+                        h->mvc_detected = 1;
                     for (unsigned i = 0; i < num_views && get_bits_left(&tmp_gb) > 0; i++) {
                         unsigned vid = get_ue_golomb_long(&tmp_gb);
                         if (vid <= 1023) {
@@ -995,8 +1006,8 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             h->cur_view_id = get_bits(&nal->gb, 10);
             skip_bits(&nal->gb, 6);            // temporal_id(3), anchor(1), inter_view(1), reserved(1)
 
-            if (!h->mvc_active) {
-                h->mvc_active = 1;
+            if (!h->mvc_detected) {
+                h->mvc_detected = 1;
                 /* Register base view (view_id=0) when MVC is first detected */
                 ret = h264_register_view_id(h, 0);
                 if (ret < 0)
@@ -1010,6 +1021,9 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
              * Default (empty): base view only. -1: all views. */
             if (!h264_view_requested(h, h->cur_view_id))
                 break;
+
+            if (!h->mvc_active)
+                h->mvc_active = 1;
 
             /* MVC dep view needs base view in the same DPB. With frame
              * threading, each worker has a separate DPB so inter-view
@@ -1465,9 +1479,9 @@ static int h264_decode_packet(H264Context *h, AVPacket *avpkt)
     if (!(avctx->flags2 & AV_CODEC_FLAG2_CHUNKS) && (!h->cur_pic_ptr || !h->has_slice)) {
         if (avctx->skip_frame >= AVDISCARD_NONREF ||
             buf_size >= 4 && !memcmp("Q264", buf, 4) ||
-            h->mvc_active)
+            h->mvc_detected)
             /*
-             * mvc_active: when MVC dep view packets are merged into the
+             * mvc_detected: when MVC dep view packets are merged into the
              * base view stream, some packets contain only EXTEN_SLICE
              * NALs which are skipped by view_ids filtering. These are
              * not errors -- just empty from the base view's perspective.
@@ -1641,8 +1655,8 @@ get_packet:
      * packets (finds SLICE at the first NAL), so the cost is negligible. */
     if (!h->is_avc && !avctx->internal->is_frame_mt &&
         h264_is_dep_view_packet(avpkt->data, avpkt->size)) {
-        if (!h->mvc_active)
-            h->mvc_active = 1;
+        if (!h->mvc_detected)
+            h->mvc_detected = 1;
         /* Cap pending list to avoid unbounded growth from a corrupt stream
          * that never sends base view packets. */
         if (h->mvc_pending_count >= H264_MAX_DPB_FRAMES) {

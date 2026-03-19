@@ -182,6 +182,12 @@ struct MpegTSContext {
 
     AVStream *epg_stream;
     AVBufferPool* pools[32];
+
+    /** MVC dep PES data buffered for combining with base */
+    AVBufferRef *mvc_dep_buf;
+    int mvc_dep_size;
+    int mvc_dep_pid;        ///< dep PID for detection, 0 if not MVC
+    int mvc_base_st_index;  ///< base H.264 stream index, -1 if unset
 };
 
 #define MPEGTS_OPTIONS \
@@ -1160,6 +1166,46 @@ static AVBufferRef *buffer_pool_get(MpegTSContext *ts, int size)
     return av_buffer_pool_get(ts->pools[index]);
 }
 
+/**
+ * Buffer dep PES data for MVC combining instead of delivering.
+ */
+static void mvc_buffer_dep_pes(MpegTSContext *ts, PESContext *pes)
+{
+    av_buffer_unref(&ts->mvc_dep_buf);
+    ts->mvc_dep_buf  = pes->buffer;
+    ts->mvc_dep_size = pes->data_index;
+    pes->buffer = NULL;
+    reset_pes_packet_state(pes);
+}
+
+/**
+ * Append buffered MVC dep data to a base PES packet.
+ */
+static int mvc_append_dep_to_pkt(MpegTSContext *ts, AVPacket *pkt)
+{
+    int base_size = pkt->size;
+    int dep_size  = ts->mvc_dep_size;
+    int total     = base_size + dep_size;
+    AVBufferRef *combined;
+
+    combined = av_buffer_alloc(total + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!combined)
+        return AVERROR(ENOMEM);
+
+    memcpy(combined->data, pkt->data, base_size);
+    memcpy(combined->data + base_size, ts->mvc_dep_buf->data, dep_size);
+    memset(combined->data + total, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+
+    av_buffer_unref(&pkt->buf);
+    pkt->buf  = combined;
+    pkt->data = combined->data;
+    pkt->size = total;
+
+    av_buffer_unref(&ts->mvc_dep_buf);
+    ts->mvc_dep_size = 0;
+    return 0;
+}
+
 /* return non zero if a packet could be constructed */
 static int mpegts_push_data(MpegTSFilter *filter,
                             const uint8_t *buf, int buf_size, int is_start,
@@ -1175,10 +1221,17 @@ static int mpegts_push_data(MpegTSFilter *filter,
 
     if (is_start) {
         if (pes->state == MPEGTS_PAYLOAD && pes->data_index > 0) {
-            ret = new_pes_packet(pes, ts->pkt);
-            if (ret < 0)
-                return ret;
-            ts->stop_parse = 1;
+            if (ts->mvc_dep_pid && pes->pid == ts->mvc_dep_pid) {
+                av_log(ts->stream, AV_LOG_DEBUG,
+                       "MVC: buffering dep PES pid=0x%x size=%d\n",
+                       pes->pid, pes->data_index);
+                mvc_buffer_dep_pes(ts, pes);
+            } else {
+                ret = new_pes_packet(pes, ts->pkt);
+                if (ret < 0)
+                    return ret;
+                ts->stop_parse = 1;
+            }
         } else {
             reset_pes_packet_state(pes);
         }
@@ -1430,12 +1483,16 @@ skip:
 
                 if (pes->data_index > 0 &&
                     pes->data_index + buf_size > max_packet_size) {
-                    ret = new_pes_packet(pes, ts->pkt);
-                    if (ret < 0)
-                        return ret;
+                    if (ts->mvc_dep_pid && pes->pid == ts->mvc_dep_pid) {
+                        mvc_buffer_dep_pes(ts, pes);
+                    } else {
+                        ret = new_pes_packet(pes, ts->pkt);
+                        if (ret < 0)
+                            return ret;
+                        ts->stop_parse = 1;
+                    }
                     pes->PES_packet_length = 0;
                     max_packet_size = ts->max_packet_size;
-                    ts->stop_parse = 1;
                 } else if (pes->data_index == 0 &&
                            buf_size > max_packet_size) {
                     // pes packet size is < ts size packet and pes data is padded with STUFFING_BYTE
@@ -1456,11 +1513,15 @@ skip:
                  * a couple of seconds to milliseconds for properly muxed files. */
                 if (!ts->stop_parse && pes->PES_packet_length &&
                     pes->pes_header_size + pes->data_index == pes->PES_packet_length + PES_START_SIZE) {
-                    ts->stop_parse = 1;
-                    ret = new_pes_packet(pes, ts->pkt);
+                    if (ts->mvc_dep_pid && pes->pid == ts->mvc_dep_pid) {
+                        mvc_buffer_dep_pes(ts, pes);
+                    } else {
+                        ts->stop_parse = 1;
+                        ret = new_pes_packet(pes, ts->pkt);
+                        if (ret < 0)
+                            return ret;
+                    }
                     pes->state = MPEGTS_SKIP;
-                    if (ret < 0)
-                        return ret;
                 }
             } while (0);
             buf_size = 0;
@@ -2612,6 +2673,7 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
                     goto out;
             }
             pes->stream_type = stream_type;
+            ts->mvc_dep_pid = pid;
             add_pid_to_program(prg, pid);
             /* Skip the descriptor loop for MVC -- we don't need codec
              * info since the base stream already has it. */
@@ -2751,6 +2813,7 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
         }
         /* Pass 2: Link all MVC PES to the base stream */
         if (base_pes) {
+            ts->mvc_base_st_index = base_pes->st->index;
             for (int j = 0; j < prg->nb_pids; j++) {
                 int p_pid = prg->pids[j];
                 if (p_pid < NB_PID_MAX && ts->pids[p_pid] &&
@@ -2759,6 +2822,8 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
                     if (p_pes->stream_type == STREAM_TYPE_VIDEO_MVC && !p_pes->st) {
                         p_pes->st = base_pes->st;
                         p_pes->merged_st = 1;
+                        if (!ts->mvc_dep_pid)
+                            ts->mvc_dep_pid = p_pes->pid;
                         av_log(ts->stream, AV_LOG_VERBOSE,
                                "MVC: merged dependent view PID 0x%x "
                                "with base H.264 PID 0x%x\n",
@@ -3374,6 +3439,7 @@ static int mpegts_read_header(AVFormatContext *s)
     }
     ts->stream     = s;
     ts->auto_guess = 0;
+    ts->mvc_base_st_index = -1;
 
     if (s->iformat == &ff_mpegts_demuxer.p) {
         /* normal demux */
@@ -3531,6 +3597,7 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     if (!ret && pkt->size < 0)
         ret = AVERROR_INVALIDDATA;
+
     return ret;
 }
 
@@ -3546,6 +3613,8 @@ static void mpegts_free(MpegTSContext *ts)
     for (i = 0; i < NB_PID_MAX; i++)
         if (ts->pids[i])
             mpegts_close_filter(ts, ts->pids[i]);
+
+    av_buffer_unref(&ts->mvc_dep_buf);
 }
 
 static int mpegts_read_close(AVFormatContext *s)
