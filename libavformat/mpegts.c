@@ -187,6 +187,7 @@ struct MpegTSContext {
     AVBufferRef *mvc_dep_buf;
     int mvc_dep_size;
     int mvc_dep_pid;        ///< dep PID for detection, 0 if not MVC
+    int mvc_dep_deliver;    ///< 1: deliver dep PES (MVC 3D), 0: absorb (default)
     int mvc_base_st_index;  ///< base H.264 stream index, -1 if unset
 };
 
@@ -211,6 +212,8 @@ static const AVOption options[] = {
      {.i64 = 0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
     {"merge_pmt_versions", "reuse streams when PMT's version/pids change", offsetof(MpegTSContext, merge_pmt_versions), AV_OPT_TYPE_BOOL,
      {.i64 = 0}, 0, 1,  AV_OPT_FLAG_DECODING_PARAM },
+    {"mvc_dep", "deliver MVC dep view PES (for 3D decode)", offsetof(MpegTSContext, mvc_dep_deliver), AV_OPT_TYPE_BOOL,
+     {.i64 = 0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
     {"skip_changes", "skip changing / adding streams / programs", offsetof(MpegTSContext, skip_changes), AV_OPT_TYPE_BOOL,
      {.i64 = 0}, 0, 1, 0 },
     {"skip_clear", "skip clearing programs", offsetof(MpegTSContext, skip_clear), AV_OPT_TYPE_BOOL,
@@ -1221,7 +1224,7 @@ static int mpegts_push_data(MpegTSFilter *filter,
 
     if (is_start) {
         if (pes->state == MPEGTS_PAYLOAD && pes->data_index > 0) {
-            if (ts->mvc_dep_pid && pes->pid == ts->mvc_dep_pid) {
+            if (ts->mvc_dep_pid && !ts->mvc_dep_deliver && pes->pid == ts->mvc_dep_pid) {
                 av_log(ts->stream, AV_LOG_DEBUG,
                        "MVC: buffering dep PES pid=0x%x size=%d\n",
                        pes->pid, pes->data_index);
@@ -1483,7 +1486,7 @@ skip:
 
                 if (pes->data_index > 0 &&
                     pes->data_index + buf_size > max_packet_size) {
-                    if (ts->mvc_dep_pid && pes->pid == ts->mvc_dep_pid) {
+                    if (ts->mvc_dep_pid && !ts->mvc_dep_deliver && pes->pid == ts->mvc_dep_pid) {
                         mvc_buffer_dep_pes(ts, pes);
                     } else {
                         ret = new_pes_packet(pes, ts->pkt);
@@ -1513,7 +1516,7 @@ skip:
                  * a couple of seconds to milliseconds for properly muxed files. */
                 if (!ts->stop_parse && pes->PES_packet_length &&
                     pes->pes_header_size + pes->data_index == pes->PES_packet_length + PES_START_SIZE) {
-                    if (ts->mvc_dep_pid && pes->pid == ts->mvc_dep_pid) {
+                    if (ts->mvc_dep_pid && !ts->mvc_dep_deliver && pes->pid == ts->mvc_dep_pid) {
                         mvc_buffer_dep_pes(ts, pes);
                     } else {
                         ts->stop_parse = 1;
