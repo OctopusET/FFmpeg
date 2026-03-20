@@ -812,12 +812,12 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             nal->ref_idc == 0 && nal->type != H264_NAL_SEI)
             continue;
 
-        /* Track dep section of combined MVC packets.  Skip dep NALs
-         * when the user only wants the base view to prevent dep
-         * parameter sets from polluting base view tables. */
+        /* MVC: track dep view section.  Skip dep PPS/SPS when MVC
+         * decode is not active to prevent dep parameter sets from
+         * polluting the base view tables during drain. */
         if (nal->type == H264_NAL_SUB_SPS || nal->type == H264_NAL_PREFIX)
             in_dep_section = 1;
-        if (in_dep_section && !h->nb_view_ids &&
+        if (in_dep_section && !h->mvc_active &&
             nal->type != H264_NAL_EXTEN_SLICE)
             continue;
 
@@ -1006,9 +1006,10 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             h->cur_view_id = get_bits(&nal->gb, 10);
             skip_bits(&nal->gb, 6);            // temporal_id(3), anchor(1), inter_view(1), reserved(1)
 
-            if (!h->mvc_detected) {
-                h->mvc_detected = 1;
-                /* Register base view (view_id=0) when MVC is first detected */
+            /* Register view IDs for discovery (view specifiers) without
+             * activating MVC decode.  mvc_active is only set after
+             * confirming the view is requested by the user. */
+            if (!h->mvc_active) {
                 ret = h264_register_view_id(h, 0);
                 if (ret < 0)
                     goto end;
@@ -1657,6 +1658,8 @@ get_packet:
         h264_is_dep_view_packet(avpkt->data, avpkt->size)) {
         if (!h->mvc_detected)
             h->mvc_detected = 1;
+        if (h->nb_view_ids && !h->mvc_active)
+            h->mvc_active = 1;
         /* Cap pending list to avoid unbounded growth from a corrupt stream
          * that never sends base view packets. */
         if (h->mvc_pending_count >= H264_MAX_DPB_FRAMES) {

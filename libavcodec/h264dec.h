@@ -640,8 +640,8 @@ typedef struct H264Context {
     int idr_pic_flag;       ///< IdrPicFlag: nal_type==5 or MVC !non_idr_flag
 
     AVContainerFifo *output_fifo;   ///< multi-frame output FIFO (MVC multiview)
-    int mvc_detected;               ///< 1 when MVC NALs have been seen
-    int mvc_active;                 ///< 1 when MVC decode is enabled (dep view requested)
+    int mvc_detected;               ///< 1 when MVC NALs seen (for suppression)
+    int mvc_active;                 ///< 1 when dep view decode is enabled
     int mvc_frame_thread_warned;    ///< log-once flag for frame thread warning
     H264Picture *mvc_base_pic;      ///< base view picture for inter-view ref
     int mvc_base_idr_decoded;       ///< base view IDR was decoded; stale dep slices must be skipped
