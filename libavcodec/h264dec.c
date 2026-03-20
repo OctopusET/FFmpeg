@@ -1697,6 +1697,7 @@ get_packet:
         H264Picture *save_cur_pic = h->cur_pic_ptr;
         int save_picture_structure = h->picture_structure;
         int save_droppable = h->droppable;
+        const PPS *save_pps = av_refstruct_ref_c(h->ps.pps);
 
         if (h->cur_pic_ptr && !h->cur_pic_ptr->view_id) {
             h->mvc_base_pic = h->cur_pic_ptr;
@@ -1714,6 +1715,9 @@ get_packet:
         h->cur_pic_ptr = save_cur_pic;
         h->picture_structure = save_picture_structure;
         h->droppable = save_droppable;
+        av_refstruct_replace(&h->ps.pps, save_pps);
+        h->ps.sps = h->ps.pps ? h->ps.pps->sps : NULL;
+        av_refstruct_unref(&save_pps);
 
         if (ret < 0)
             return ret;
