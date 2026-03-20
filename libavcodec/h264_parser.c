@@ -68,7 +68,6 @@ typedef struct H264ParseContext {
     int parse_nal_header_bytes_left;
     int64_t reference_dts;
     int last_frame_num, last_picture_structure;
-    int mvc_in_dep_section; ///< inside MVC dep view section of combined packet
 } H264ParseContext;
 
 static int find_start_code(const uint8_t *buf, int buf_size,
@@ -125,27 +124,6 @@ static int h264_find_frame_end(H264ParseContext *p, const uint8_t *buf,
                 state >>= 1;           // 2->1, 1->0, 0->0
         } else if (state <= 5) {
             int nalu_type = buf[i] & 0x1F;
-
-            /* MVC combined packets: once we see a dep-view NAL after
-             * a base slice, skip all boundary triggers to keep the
-             * combined access unit intact. */
-            if (pc->frame_start_found &&
-                (nalu_type == H264_NAL_SUB_SPS || nalu_type == H264_NAL_PREFIX ||
-                 nalu_type == H264_NAL_EXTEN_SLICE || nalu_type >= 24)) {
-                p->mvc_in_dep_section = 1;
-                state = 7;
-                continue;
-            }
-            if (p->mvc_in_dep_section) {
-                if (nalu_type == H264_NAL_AUD || nalu_type == H264_NAL_SPS ||
-                    nalu_type == H264_NAL_IDR_SLICE || nalu_type == H264_NAL_SLICE)
-                    p->mvc_in_dep_section = 0;
-                else {
-                    state = 7;
-                    continue;
-                }
-            }
-
             if (nalu_type == H264_NAL_SEI || nalu_type == H264_NAL_SPS ||
                 nalu_type == H264_NAL_PPS || nalu_type == H264_NAL_AUD ||
                 nalu_type == H264_NAL_SUB_SPS || nalu_type == H264_NAL_PREFIX) {
@@ -329,7 +307,6 @@ static inline int parse_nal_units(AVCodecParserContext *s,
 
     buf_index     = 0;
     next_avc      = p->is_avc ? 0 : buf_size;
-    int in_dep_section = 0, saw_base_slice = 0;
     for (;;) {
         const SPS *sps;
         int src_length, consumed, nalsize = 0;
@@ -382,17 +359,6 @@ static inline int parse_nal_units(AVCodecParserContext *s,
         get_bits1(&nal.gb);
         nal.ref_idc = get_bits(&nal.gb, 2);
         nal.type    = get_bits(&nal.gb, 5);
-
-        /* MVC combined packets: skip dep-section NALs to prevent
-         * dep PPS/SPS/slice from corrupting parser POC state. */
-        if (nal.type == H264_NAL_SLICE || nal.type == H264_NAL_IDR_SLICE)
-            saw_base_slice = 1;
-        if (saw_base_slice &&
-            (nal.type == H264_NAL_SUB_SPS || nal.type == H264_NAL_PREFIX ||
-             nal.type == H264_NAL_EXTEN_SLICE || nal.type >= 24))
-            in_dep_section = 1;
-        if (in_dep_section)
-            continue;
 
         switch (nal.type) {
         case H264_NAL_SPS:

@@ -817,7 +817,7 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
          * polluting the base view tables during drain. */
         if (nal->type == H264_NAL_SUB_SPS || nal->type == H264_NAL_PREFIX)
             in_dep_section = 1;
-        if (in_dep_section && !h->mvc_active &&
+        if (in_dep_section && !h->nb_view_ids &&
             nal->type != H264_NAL_EXTEN_SLICE)
             continue;
 
