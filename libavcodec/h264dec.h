@@ -174,6 +174,10 @@ typedef struct H264Picture {
     int gray;
 
     int view_id;            ///< MVC view identifier (0=base, >0=dependent)
+    /** For dep view frames: index into views[0].DPB of the base view
+     *  frame from the same access unit.  -1 if not available.
+     *  Used for inter-view prediction (MVC Annex H). */
+    int base_view_frame;
 } H264Picture;
 
 typedef struct H264Ref {
@@ -372,10 +376,13 @@ typedef struct H264ViewContext {
     int current_slice;
     int nb_slice_ctx_queued;
 
+    H264Picture DPB[H264_MAX_PICTURE_COUNT];
+
     H264Picture *short_ref[32];
     H264Picture *long_ref[32];
     int short_ref_count;
     int long_ref_count;
+
 
     int has_slice;
 } H264ViewContext;
@@ -395,7 +402,6 @@ typedef struct H264Context {
     H264ViewContext *view;       ///< cached pointer to views[cur_view]
     int              cur_view;   ///< active view index (0=base, 1=dep)
 
-    H264Picture DPB[H264_MAX_PICTURE_COUNT];
 
     H264SliceContext *slice_ctx;
     int            nb_slice_ctx;

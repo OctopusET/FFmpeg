@@ -334,26 +334,17 @@ static int h264_init_context(AVCodecContext *avctx, H264Context *h)
         return AVERROR(ENOMEM);
     }
 
-    for (i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
-        if ((ret = h264_init_pic(&h->DPB[i])) < 0)
+    /* Init both views' DPB, cur_pic, last_pic_for_ec */
+    for (int v = 0; v < 2; v++) {
+        for (i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
+            if ((ret = h264_init_pic(&h->views[v].DPB[i])) < 0)
+                return ret;
+        }
+        if ((ret = h264_init_pic(&h->views[v].cur_pic)) < 0)
+            return ret;
+        if ((ret = h264_init_pic(&h->views[v].last_pic_for_ec)) < 0)
             return ret;
     }
-
-    if ((ret = h264_init_pic(&h->view->cur_pic)) < 0)
-        return ret;
-
-    if ((ret = h264_init_pic(&h->view->last_pic_for_ec)) < 0)
-        return ret;
-
-    /* Init views[1] (dep view) AVFrames */
-    h->views[1].cur_pic.f = av_frame_alloc();
-    h->views[1].cur_pic.f_grain = av_frame_alloc();
-    if (!h->views[1].cur_pic.f || !h->views[1].cur_pic.f_grain)
-        return AVERROR(ENOMEM);
-    h->views[1].last_pic_for_ec.f = av_frame_alloc();
-    h->views[1].last_pic_for_ec.f_grain = av_frame_alloc();
-    if (!h->views[1].last_pic_for_ec.f || !h->views[1].last_pic_for_ec.f_grain)
-        return AVERROR(ENOMEM);
 
     for (i = 0; i < h->nb_slice_ctx; i++)
         h->slice_ctx[i].h264 = h;
@@ -376,13 +367,15 @@ static av_cold int h264_decode_end(AVCodecContext *avctx)
     ff_h264_remove_all_refs(h);
     ff_h264_free_tables(h);
 
-    for (i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
-        h264_free_pic(h, &h->DPB[i]);
+    for (int v = 0; v < 2; v++) {
+        for (i = 0; i < H264_MAX_PICTURE_COUNT; i++)
+            h264_free_pic(h, &h->views[v].DPB[i]);
+        h264_free_pic(h, &h->views[v].cur_pic);
+        h264_free_pic(h, &h->views[v].last_pic_for_ec);
+        h->views[v].cur_pic_ptr = NULL;
     }
     memset(h->delayed_pic, 0, sizeof(h->delayed_pic));
     memset(h->delayed_pic_dep, 0, sizeof(h->delayed_pic_dep));
-
-    h->view->cur_pic_ptr = NULL;
 
     av_refstruct_pool_uninit(&h->decode_error_flags_pool);
     av_container_fifo_free(&h->output_fifo);
@@ -398,16 +391,6 @@ static av_cold int h264_decode_end(AVCodecContext *avctx)
     ff_h264_ps_uninit(&h->ps);
 
     ff_h2645_packet_uninit(&h->pkt);
-
-    h264_free_pic(h, &h->view->cur_pic);
-    h264_free_pic(h, &h->view->last_pic_for_ec);
-
-    ff_h264_unref_picture(&h->views[1].cur_pic);
-    av_frame_free(&h->views[1].cur_pic.f);
-    av_frame_free(&h->views[1].cur_pic.f_grain);
-    ff_h264_unref_picture(&h->views[1].last_pic_for_ec);
-    av_frame_free(&h->views[1].last_pic_for_ec.f);
-    av_frame_free(&h->views[1].last_pic_for_ec.f_grain);
 
     return 0;
 }
@@ -587,7 +570,7 @@ static av_cold void h264_decode_flush(AVCodecContext *avctx)
     ff_h264_sei_uninit(&h->sei);
 
     for (i = 0; i < H264_MAX_PICTURE_COUNT; i++)
-        ff_h264_unref_picture(&h->DPB[i]);
+        ff_h264_unref_picture(&h->view->DPB[i]);
     h->view->cur_pic_ptr = NULL;
     ff_h264_unref_picture(&h->view->cur_pic);
 
