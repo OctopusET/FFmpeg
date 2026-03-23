@@ -238,14 +238,14 @@ static int vaapi_h264_start_frame(AVCodecContext          *avctx,
                                   av_unused uint32_t       size)
 {
     const H264Context *h = avctx->priv_data;
-    VAAPIDecodePicture *pic = h->cur_pic_ptr->hwaccel_picture_private;
+    VAAPIDecodePicture *pic = h->view->cur_pic_ptr->hwaccel_picture_private;
     const PPS *pps = h->ps.pps;
     const SPS *sps = h->ps.sps;
     VAPictureParameterBufferH264 pic_param;
     VAIQMatrixBufferH264 iq_matrix;
     int err;
 
-    pic->output_surface = ff_vaapi_get_surface_id(h->cur_pic_ptr->f);
+    pic->output_surface = ff_vaapi_get_surface_id(h->view->cur_pic_ptr->f);
 
     pic_param = (VAPictureParameterBufferH264) {
         .picture_width_in_mbs_minus1                = h->mb_width - 1,
@@ -275,17 +275,17 @@ static int vaapi_h264_start_frame(AVCodecContext          *avctx,
             .weighted_pred_flag                     = pps->weighted_pred,
             .weighted_bipred_idc                    = pps->weighted_bipred_idc,
             .transform_8x8_mode_flag                = pps->transform_8x8_mode,
-            .field_pic_flag                         = h->picture_structure != PICT_FRAME,
+            .field_pic_flag                         = h->view->picture_structure != PICT_FRAME,
             .constrained_intra_pred_flag            = pps->constrained_intra_pred,
             .pic_order_present_flag                 = pps->pic_order_present,
             .deblocking_filter_control_present_flag = pps->deblocking_filter_parameters_present,
             .redundant_pic_cnt_present_flag         = pps->redundant_pic_cnt_present,
-            .reference_pic_flag                     = h->nal_ref_idc != 0,
+            .reference_pic_flag                     = h->view->nal_ref_idc != 0,
         },
-        .frame_num                                  = h->cur_pic_ptr->frame_num,
+        .frame_num                                  = h->view->cur_pic_ptr->frame_num,
     };
 
-    fill_vaapi_pic(&pic_param.CurrPic, h->cur_pic_ptr, h->picture_structure);
+    fill_vaapi_pic(&pic_param.CurrPic, h->view->cur_pic_ptr, h->view->picture_structure);
     err = fill_vaapi_ReferenceFrames(&pic_param, h);
     if (err < 0)
         goto fail;
@@ -320,7 +320,7 @@ fail:
 static int vaapi_h264_end_frame(AVCodecContext *avctx)
 {
     const H264Context *h = avctx->priv_data;
-    VAAPIDecodePicture *pic = h->cur_pic_ptr->hwaccel_picture_private;
+    VAAPIDecodePicture *pic = h->view->cur_pic_ptr->hwaccel_picture_private;
     H264SliceContext *sl = &h->slice_ctx[0];
     int ret;
 
@@ -340,7 +340,7 @@ static int vaapi_h264_decode_slice(AVCodecContext *avctx,
                                    uint32_t        size)
 {
     const H264Context *h = avctx->priv_data;
-    VAAPIDecodePicture *pic = h->cur_pic_ptr->hwaccel_picture_private;
+    VAAPIDecodePicture *pic = h->view->cur_pic_ptr->hwaccel_picture_private;
     const H264SliceContext *sl  = &h->slice_ctx[0];
     VASliceParameterBufferH264 slice_param;
     int err;

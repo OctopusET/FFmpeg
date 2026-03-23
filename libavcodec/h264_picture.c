@@ -190,7 +190,7 @@ void ff_h264_set_erpic(ERPicture *dst, const H264Picture *src)
 int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup)
 {
     AVCodecContext *const avctx = h->avctx;
-    H264Picture *cur = h->cur_pic_ptr;
+    H264Picture *cur = h->view->cur_pic_ptr;
     int err = 0;
     h->mb_y = 0;
 
@@ -199,7 +199,7 @@ int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup)
          * the dep view's slice header overwrites prev_poc_msb/lsb, and
          * the next base view slice computes POC from wrong state. */
         H264POCContext *const poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
-        if (!h->droppable) {
+        if (!h->view->droppable) {
             err = ff_h264_execute_ref_pic_marking(h);
             poc->prev_poc_msb = poc->poc_msb;
             poc->prev_poc_lsb = poc->poc_lsb;
@@ -213,7 +213,7 @@ int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup)
         if (err < 0)
             av_log(avctx, AV_LOG_ERROR,
                    "hardware accelerator failed to decode picture\n");
-    } else if (!in_setup && cur->needs_fg && (!FIELD_PICTURE(h) || !h->first_field)) {
+    } else if (!in_setup && cur->needs_fg && (!FIELD_PICTURE(h) || !h->view->first_field)) {
         const AVFrameSideData *sd = av_frame_get_side_data(cur->f, AV_FRAME_DATA_FILM_GRAIN_PARAMS);
 
         err = AVERROR_INVALIDDATA;
@@ -228,12 +228,12 @@ int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup)
         }
     }
 
-    if (!in_setup && !h->droppable)
+    if (!in_setup && !h->view->droppable)
         ff_thread_report_progress(&cur->tf, INT_MAX,
-                                  h->picture_structure == PICT_BOTTOM_FIELD);
+                                  h->view->picture_structure == PICT_BOTTOM_FIELD);
     emms_c();
 
-    h->current_slice = 0;
+    h->view->current_slice = 0;
 
     return err;
 }

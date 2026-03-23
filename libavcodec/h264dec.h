@@ -64,7 +64,7 @@
 #define MB_MBAFF(h)    (h)->mb_mbaff
 #define MB_FIELD(sl)  (sl)->mb_field_decoding_flag
 #define FRAME_MBAFF(h) (h)->mb_aff_frame
-#define FIELD_PICTURE(h) ((h)->picture_structure != PICT_FRAME)
+#define FIELD_PICTURE(h) ((h)->view->picture_structure != PICT_FRAME)
 #define LEFT_MBS 2
 #define LTOP     0
 #define LBOT     1
@@ -345,6 +345,36 @@ typedef struct H264SliceContext {
 } H264SliceContext;
 
 /**
+ * Per-view decoder state for H.264 MVC (Multiview Video Coding).
+ *
+ * Isolates fields that must be independent per view during MVC
+ * dependent view drain.  For non-MVC, only views[0] is used.
+ */
+typedef struct H264ViewContext {
+    H264Picture *cur_pic_ptr;
+    H264Picture  cur_pic;
+    H264Picture  last_pic_for_ec;
+
+    int first_field;
+    int picture_structure;
+    int droppable;
+
+    int idr_pic_flag;
+    int nal_ref_idc;
+    int nal_unit_type;
+    int picture_idr;
+
+    MMCO mmco[H264_MAX_MMCO_COUNT];
+    int  nb_mmco;
+    int  mmco_reset;
+    int  explicit_ref_marking;
+
+    int current_slice;
+    int nb_slice_ctx_queued;
+    int has_slice;
+} H264ViewContext;
+
+/**
  * H264Context
  */
 typedef struct H264Context {
@@ -355,14 +385,14 @@ typedef struct H264Context {
     H264ChromaContext h264chroma;
     H264QpelContext h264qpel;
 
+    H264ViewContext  views[2];   ///< [0]=base, [1]=dep; non-MVC uses [0] only
+    H264ViewContext *view;       ///< cached pointer to views[cur_view]
+    int              cur_view;   ///< active view index (0=base, 1=dep)
+
     H264Picture DPB[H264_MAX_PICTURE_COUNT];
-    H264Picture *cur_pic_ptr;
-    H264Picture cur_pic;
-    H264Picture last_pic_for_ec;
 
     H264SliceContext *slice_ctx;
     int            nb_slice_ctx;
-    int            nb_slice_ctx_queued;
 
     H2645Packet pkt;
 
@@ -371,8 +401,6 @@ typedef struct H264Context {
     /* coded dimensions -- 16 * mb w/h */
     int width, height;
     int chroma_x_shift, chroma_y_shift;
-
-    int droppable;
 
     int context_initialized;
     int flags;
@@ -383,11 +411,6 @@ typedef struct H264Context {
      * during normal MB decoding and execute it serially at the end.
      */
     int postpone_filter;
-
-    /*
-     * Set to 1 when the current picture is IDR, 0 otherwise.
-     */
-    int picture_idr;
 
     /*
      * Set to 1 when the current picture contains only I slices, 0 otherwise.
@@ -420,8 +443,6 @@ typedef struct H264Context {
 
     // interlacing specific flags
     int mb_aff_frame;
-    int picture_structure;
-    int first_field;
 
     uint8_t *list_counts;               ///< Array of list_count per MB specifying the slice type
 
@@ -454,11 +475,6 @@ typedef struct H264Context {
 
     // =============================================================
     // Things below are not used in the MB or more inner code
-
-    int nal_ref_idc;
-    int nal_unit_type;
-
-    int has_slice;          ///< slice NAL is found in the packet, set by decode_nal_units, its state does not need to be preserved outside h264_decode_frame()
 
     /**
      * Used to parse AVC variant of H.264
@@ -495,27 +511,8 @@ typedef struct H264Context {
     int next_outputed_poc_dep;
     int poc_offset;         ///< PicOrderCnt_offset from SMPTE RDD-2006
 
-    /**
-     * memory management control operations buffer.
-     */
-    MMCO mmco[H264_MAX_MMCO_COUNT];
-    int  nb_mmco;
-    int mmco_reset;
-    int explicit_ref_marking;
-
     int long_ref_count;     ///< number of actual long term references
     int short_ref_count;    ///< number of actual short term references
-
-    /**
-     * @name Members for slice based multithreading
-     * @{
-     */
-    /**
-     * current slice number, used to initialize slice_num of each thread/context
-     */
-    int current_slice;
-
-    /** @} */
 
     /**
      * Complement sei_pic_struct
@@ -637,7 +634,6 @@ typedef struct H264Context {
      * @{
      */
     int cur_view_id;        ///< MVC view_id of current NAL (0=base)
-    int idr_pic_flag;       ///< IdrPicFlag: nal_type==5 or MVC !non_idr_flag
 
     AVContainerFifo *output_fifo;   ///< multi-frame output FIFO (MVC multiview)
     int mvc_detected;               ///< 1 when MVC NALs seen (for suppression)
@@ -663,6 +659,12 @@ typedef struct H264Context {
     unsigned nb_view_pos_available;
     /** @} */
 } H264Context;
+
+static inline void h264_set_view(H264Context *h, int view_idx)
+{
+    h->cur_view = view_idx;
+    h->view     = &h->views[view_idx];
+}
 
 extern const uint16_t ff_h264_mb_sizes[4];
 

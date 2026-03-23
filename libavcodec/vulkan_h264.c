@@ -367,7 +367,7 @@ static int vk_h264_start_frame(AVCodecContext          *avctx,
     int dpb_slot_index = 0;
     H264Context *h = avctx->priv_data;
 
-    H264Picture *pic = h->cur_pic_ptr;
+    H264Picture *pic = h->view->cur_pic_ptr;
     H264VulkanDecodePicture *hp = pic->hwaccel_picture_private;
     FFVulkanDecodePicture *vp = &hp->vp;
 
@@ -441,11 +441,11 @@ static int vk_h264_start_frame(AVCodecContext          *avctx,
         .flags = (StdVideoDecodeH264PictureInfoFlags) {
             .field_pic_flag = FIELD_PICTURE(h),
             .is_intra = 1, /* Set later */
-            .IdrPicFlag = h->picture_idr,
-            .bottom_field_flag = h->picture_structure != PICT_FRAME &&
-                                 h->picture_structure & PICT_BOTTOM_FIELD,
-            .is_reference = h->nal_ref_idc != 0,
-            .complementary_field_pair = h->first_field && FIELD_PICTURE(h),
+            .IdrPicFlag = h->view->picture_idr,
+            .bottom_field_flag = h->view->picture_structure != PICT_FRAME &&
+                                 h->view->picture_structure & PICT_BOTTOM_FIELD,
+            .is_reference = h->view->nal_ref_idc != 0,
+            .complementary_field_pair = h->view->first_field && FIELD_PICTURE(h),
         },
     };
 
@@ -479,7 +479,7 @@ static int vk_h264_decode_slice(AVCodecContext *avctx,
 {
     const H264Context *h = avctx->priv_data;
     const H264SliceContext *sl  = &h->slice_ctx[0];
-    H264VulkanDecodePicture *hp = h->cur_pic_ptr->hwaccel_picture_private;
+    H264VulkanDecodePicture *hp = h->view->cur_pic_ptr->hwaccel_picture_private;
     FFVulkanDecodePicture *vp = &hp->vp;
 
     int err = ff_vk_decode_add_slice(avctx, vp, data, size, 1,
@@ -504,7 +504,7 @@ static int vk_h264_end_frame(AVCodecContext *avctx)
     FFVulkanDecodeContext *dec = avctx->internal->hwaccel_priv_data;
     FFVulkanDecodeShared *ctx = dec->shared_ctx;
 
-    H264Picture *pic = h->cur_pic_ptr;
+    H264Picture *pic = h->view->cur_pic_ptr;
     H264VulkanDecodePicture *hp = pic->hwaccel_picture_private;
     FFVulkanDecodePicture *vp = &hp->vp;
     FFVulkanDecodePicture *rvp[H264_MAX_PICTURE_COUNT] = { 0 };

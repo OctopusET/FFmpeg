@@ -125,9 +125,9 @@ static int add_sorted(H264Picture **sorted, H264Picture * const *src,
 static int mismatches_ref(const H264Context *h, const H264Picture *pic)
 {
     const AVFrame *f = pic->f;
-    return (h->cur_pic_ptr->f->width  != f->width ||
-            h->cur_pic_ptr->f->height != f->height ||
-            h->cur_pic_ptr->f->format != f->format);
+    return (h->view->cur_pic_ptr->f->width  != f->width ||
+            h->view->cur_pic_ptr->f->height != f->height ||
+            h->view->cur_pic_ptr->f->format != f->format);
 }
 
 /**
@@ -162,9 +162,9 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
         int lens[2];
 
         if (FIELD_PICTURE(h))
-            cur_poc = h->cur_pic_ptr->field_poc[h->picture_structure == PICT_BOTTOM_FIELD];
+            cur_poc = h->view->cur_pic_ptr->field_poc[h->view->picture_structure == PICT_BOTTOM_FIELD];
         else
-            cur_poc = h->cur_pic_ptr->poc;
+            cur_poc = h->view->cur_pic_ptr->poc;
 
         for (int list = 0; list < 2; list++) {
             len  = add_sorted(sorted,       view_short_ref, view_short_count, cur_poc, 1 ^ list);
@@ -172,10 +172,10 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
             av_assert0(len <= 32);
 
             len  = build_def_list(sl->ref_list[list], FF_ARRAY_ELEMS(sl->ref_list[0]),
-                                  sorted, len, 0, h->picture_structure);
+                                  sorted, len, 0, h->view->picture_structure);
             len += build_def_list(sl->ref_list[list] + len,
                                   FF_ARRAY_ELEMS(sl->ref_list[0]) - len,
-                                  view_long_ref, 16, 1, h->picture_structure);
+                                  view_long_ref, 16, 1, h->view->picture_structure);
             av_assert0(len <= 32);
 
             if (len < sl->ref_count[list])
@@ -194,10 +194,10 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
         }
     } else {
         len  = build_def_list(sl->ref_list[0], FF_ARRAY_ELEMS(sl->ref_list[0]),
-                              view_short_ref, view_short_count, 0, h->picture_structure);
+                              view_short_ref, view_short_count, 0, h->view->picture_structure);
         len += build_def_list(sl->ref_list[0] + len,
                               FF_ARRAY_ELEMS(sl->ref_list[0]) - len,
-                              view_long_ref, 16, 1, h->picture_structure);
+                              view_long_ref, 16, 1, h->view->picture_structure);
         av_assert0(len <= 32);
 
         if (len < sl->ref_count[0])
@@ -213,7 +213,7 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
      */
     if (h->cur_view_id) {
         H264Picture *iv_ref = NULL;
-        int cur_frame_num = h->cur_pic_ptr->frame_num;
+        int cur_frame_num = h->view->cur_pic_ptr->frame_num;
 
         if (h->mvc_base_pic && h->mvc_base_pic->f->buf[0] &&
             h->mvc_base_pic->frame_num == cur_frame_num)
@@ -241,7 +241,7 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
                     ref_from_h264pic(&sl->ref_list[list][pos], iv_ref);
                     if (FIELD_PICTURE(h)) {
                         pic_as_field(&sl->ref_list[list][pos],
-                                     h->picture_structure);
+                                     h->view->picture_structure);
                     } else {
                         /* Override reference for droppable base view
                          * frames to pass ref list validation. */
@@ -326,7 +326,7 @@ static void print_long_term(const H264Context *h)
  */
 static int pic_num_extract(const H264Context *h, int pic_num, int *structure)
 {
-    *structure = h->picture_structure;
+    *structure = h->view->picture_structure;
     if (FIELD_PICTURE(h)) {
         if (!(pic_num & 1))
             /* opposite field */
@@ -440,8 +440,8 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
             case 4: {
                 /* MVC inter-view ref list modification (idc=4, Annex H).
                  * Find picture with different view_id, same frame_num. */
-                int cur_frame_num = h->cur_pic_ptr->frame_num;
-                pic_structure = h->picture_structure;
+                int cur_frame_num = h->view->cur_pic_ptr->frame_num;
+                pic_structure = h->view->picture_structure;
                 for (i = h->short_ref_count - 1; i >= 0; i--) {
                     ref = h->short_ref[i];
                     if (ref->view_id != h->cur_view_id &&
@@ -458,8 +458,8 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                  * Find inter-view picture with different view_id, same
                  * frame_num. Use mvc_base_pic (protected by MVC_IV_REF)
                  * first, then fall back to DPB search. */
-                int cur_frame_num = h->cur_pic_ptr->frame_num;
-                pic_structure = h->picture_structure;
+                int cur_frame_num = h->view->cur_pic_ptr->frame_num;
+                pic_structure = h->view->picture_structure;
                 i = -1;
 
                 if (h->mvc_base_pic && h->mvc_base_pic->f->buf[0] &&
@@ -497,7 +497,7 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                     av_log(h->avctx, AV_LOG_DEBUG,
                            "  idc=%d view=%d cur_fn=%d pic_id=%d\n",
                            modification_of_pic_nums_idc, h->cur_view_id,
-                           h->cur_pic_ptr->frame_num, pic_id);
+                           h->view->cur_pic_ptr->frame_num, pic_id);
                     for (int k = 0; k < h->short_ref_count; k++)
                         av_log(h->avctx, AV_LOG_DEBUG,
                                "  short_ref[%d]: view=%d fn=%d ref=%d\n",
@@ -760,9 +760,9 @@ void ff_h264_remove_all_refs(H264Context *h)
         remove_long(h, i, 0);
     assert(h->long_ref_count == 0);
 
-    if (h->short_ref_count && !h->last_pic_for_ec.f->data[0]) {
-        ff_h264_unref_picture(&h->last_pic_for_ec);
-        ff_h264_ref_picture(&h->last_pic_for_ec, h->short_ref[0]);
+    if (h->short_ref_count && !h->view->last_pic_for_ec.f->data[0]) {
+        ff_h264_unref_picture(&h->view->last_pic_for_ec);
+        ff_h264_ref_picture(&h->view->last_pic_for_ec, h->short_ref[0]);
     }
 
     for (int i = 0; i < h->short_ref_count; i++) {
@@ -780,7 +780,7 @@ void ff_h264_remove_all_refs(H264Context *h)
  */
 static void generate_sliding_window_mmcos(H264Context *h)
 {
-    MMCO *mmco = h->mmco;
+    MMCO *mmco = h->view->mmco;
     int nb_mmco = 0;
     int view_short_count = 0;
     int view_long_count = 0;
@@ -803,7 +803,7 @@ static void generate_sliding_window_mmcos(H264Context *h)
 
     if (view_short_count &&
         view_long_count + view_short_count >= h->ps.sps->ref_frame_count &&
-        !(FIELD_PICTURE(h) && !h->first_field && h->cur_pic_ptr->reference)) {
+        !(FIELD_PICTURE(h) && !h->view->first_field && h->view->cur_pic_ptr->reference)) {
         mmco[0].opcode        = MMCO_SHORT2UNUSED;
         mmco[0].short_pic_num = h->short_ref[oldest_view_idx]->frame_num;
         nb_mmco               = 1;
@@ -815,12 +815,12 @@ static void generate_sliding_window_mmcos(H264Context *h)
         }
     }
 
-    h->nb_mmco = nb_mmco;
+    h->view->nb_mmco = nb_mmco;
 }
 
 int ff_h264_execute_ref_pic_marking(H264Context *h)
 {
-    MMCO *mmco = h->mmco;
+    MMCO *mmco = h->view->mmco;
     int mmco_count;
     int pps_ref_count[2] = {0};
     int current_ref_assigned = 0, err = 0;
@@ -831,17 +831,17 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
         goto out;
     }
 
-    if (!h->explicit_ref_marking)
+    if (!h->view->explicit_ref_marking)
         generate_sliding_window_mmcos(h);
-    mmco_count = h->nb_mmco;
+    mmco_count = h->view->nb_mmco;
 
     if ((h->avctx->debug & FF_DEBUG_MMCO) && mmco_count == 0)
         av_log(h->avctx, AV_LOG_DEBUG, "no mmco here\n");
 
     for (int i = 0; i < mmco_count; i++) {
         if (h->avctx->debug & FF_DEBUG_MMCO)
-            av_log(h->avctx, AV_LOG_DEBUG, "mmco:%d %d %d\n", h->mmco[i].opcode,
-                   h->mmco[i].short_pic_num, h->mmco[i].long_arg);
+            av_log(h->avctx, AV_LOG_DEBUG, "mmco:%d %d %d\n", h->view->mmco[i].opcode,
+                   h->view->mmco[i].short_pic_num, h->view->mmco[i].long_arg);
 
         switch (mmco[i].opcode) {
         case MMCO_SHORT2UNUSED:
@@ -862,7 +862,7 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
             if (mmco[i].opcode == MMCO_SHORT2UNUSED) {
                 if (h->avctx->debug & FF_DEBUG_MMCO)
                     av_log(h->avctx, AV_LOG_DEBUG, "mmco: unref short %d count %d\n",
-                           h->mmco[i].short_pic_num, h->short_ref_count);
+                           h->view->mmco[i].short_pic_num, h->short_ref_count);
                 remove_short(h, frame_num, structure ^ PICT_FRAME);
             } else {
                 if (h->long_ref[mmco[i].long_arg] != pic)
@@ -894,15 +894,15 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
                      * Report the problem and keep the pair where it is,
                      * and mark this field valid.
                      */
-            if (h->short_ref[0] == h->cur_pic_ptr) {
+            if (h->short_ref[0] == h->view->cur_pic_ptr) {
                 av_log(h->avctx, AV_LOG_ERROR, "mmco: cannot assign current picture to short and long at the same time\n");
                 remove_short_at_index(h, 0);
             }
 
             /* make sure the current picture is not already assigned as a long ref */
-            if (h->cur_pic_ptr->long_ref) {
+            if (h->view->cur_pic_ptr->long_ref) {
                 for (int j = 0; j < FF_ARRAY_ELEMS(h->long_ref); j++) {
-                    if (h->long_ref[j] == h->cur_pic_ptr) {
+                    if (h->long_ref[j] == h->view->cur_pic_ptr) {
                         if (j != mmco[i].long_arg)
                             av_log(h->avctx, AV_LOG_ERROR, "mmco: cannot assign current picture to 2 long term references\n");
                         remove_long(h, j, 0);
@@ -910,16 +910,16 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
                 }
             }
 
-            if (h->long_ref[mmco[i].long_arg] != h->cur_pic_ptr) {
-                av_assert0(!h->cur_pic_ptr->long_ref);
+            if (h->long_ref[mmco[i].long_arg] != h->view->cur_pic_ptr) {
+                av_assert0(!h->view->cur_pic_ptr->long_ref);
                 remove_long(h, mmco[i].long_arg, 0);
 
-                h->long_ref[mmco[i].long_arg]           = h->cur_pic_ptr;
+                h->long_ref[mmco[i].long_arg]           = h->view->cur_pic_ptr;
                 h->long_ref[mmco[i].long_arg]->long_ref = 1;
                 h->long_ref_count++;
             }
 
-            h->cur_pic_ptr->reference |= h->picture_structure;
+            h->view->cur_pic_ptr->reference |= h->view->picture_structure;
             current_ref_assigned = 1;
             break;
         case MMCO_SET_MAX_LONG:
@@ -947,9 +947,9 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
                      h->long_ref[j]->view_id == h->cur_view_id))
                     remove_long(h, j, 0);
             }
-            poc->frame_num = h->cur_pic_ptr->frame_num = 0;
-            h->mmco_reset = 1;
-            h->cur_pic_ptr->mmco_reset = 1;
+            poc->frame_num = h->view->cur_pic_ptr->frame_num = 0;
+            h->view->mmco_reset = 1;
+            h->view->cur_pic_ptr->mmco_reset = 1;
             if (h->cur_view_id) {
                 for (int j = 0; j < FF_ARRAY_ELEMS(h->last_pocs_dep); j++)
                     h->last_pocs_dep[j] = INT_MIN;
@@ -970,10 +970,10 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
          * in long_ref; trying to put it on the short list here is an
          * error in the encoded bit stream (ref: 7.4.3.3, NOTE 2 and 3).
          */
-        if (h->short_ref_count && h->short_ref[0] == h->cur_pic_ptr) {
+        if (h->short_ref_count && h->short_ref[0] == h->view->cur_pic_ptr) {
             /* Just mark the second field valid */
-            h->cur_pic_ptr->reference |= h->picture_structure;
-        } else if (h->cur_pic_ptr->long_ref) {
+            h->view->cur_pic_ptr->reference |= h->view->picture_structure;
+        } else if (h->view->cur_pic_ptr->long_ref) {
             av_log(h->avctx, AV_LOG_ERROR, "illegal short term reference "
                                            "assignment for second field "
                                            "in complementary field pair "
@@ -984,7 +984,7 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
              * to avoid removing the other view's picture. */
             H264Picture *pic = NULL;
             for (int j = 0; j < h->short_ref_count; j++) {
-                if (h->short_ref[j]->frame_num == h->cur_pic_ptr->frame_num &&
+                if (h->short_ref[j]->frame_num == h->view->cur_pic_ptr->frame_num &&
                     h->short_ref[j]->view_id == h->cur_view_id) {
                     pic = h->short_ref[j];
                     unreference_pic(h, pic, 0);
@@ -1009,9 +1009,9 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
                 memmove(&h->short_ref[1], &h->short_ref[0],
                         h->short_ref_count * sizeof(H264Picture*));
 
-            h->short_ref[0] = h->cur_pic_ptr;
+            h->short_ref[0] = h->view->cur_pic_ptr;
             h->short_ref_count++;
-            h->cur_pic_ptr->reference |= h->picture_structure;
+            h->view->cur_pic_ptr->reference |= h->view->picture_structure;
         }
     }
 
@@ -1065,7 +1065,7 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
     for (int i = 0; i < h->short_ref_count; i++) {
         H264Picture *pic = h->short_ref[i];
         if (pic->invalid_gap) {
-            int d = av_zero_extend(h->cur_pic_ptr->frame_num - pic->frame_num, h->ps.sps->log2_max_frame_num);
+            int d = av_zero_extend(h->view->cur_pic_ptr->frame_num - pic->frame_num, h->ps.sps->log2_max_frame_num);
             if (d > h->ps.sps->ref_frame_count)
                 remove_short(h, pic->frame_num, 0);
         }
@@ -1087,10 +1087,10 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
         && h->long_ref_count==0
         && (   h->short_ref_count<=2
             || pps_ref_count[0] <= 2 && pps_ref_count[1] <= 1 && h->avctx->has_b_frames
-            || pps_ref_count[0] <= 1 + (h->picture_structure != PICT_FRAME) && pps_ref_count[1] <= 1)
-        && pps_ref_count[0]<=2 + (h->picture_structure != PICT_FRAME) + (2*!h->has_recovery_point)
-        && h->cur_pic_ptr->f->pict_type == AV_PICTURE_TYPE_I){
-        h->cur_pic_ptr->recovered |= FRAME_RECOVERED_HEURISTIC;
+            || pps_ref_count[0] <= 1 + (h->view->picture_structure != PICT_FRAME) && pps_ref_count[1] <= 1)
+        && pps_ref_count[0]<=2 + (h->view->picture_structure != PICT_FRAME) + (2*!h->has_recovery_point)
+        && h->view->cur_pic_ptr->f->pict_type == AV_PICTURE_TYPE_I){
+        h->view->cur_pic_ptr->recovered |= FRAME_RECOVERED_HEURISTIC;
         if(!h->avctx->has_b_frames)
             h->frame_recovered |= FRAME_RECOVERED_HEURISTIC;
     }
@@ -1133,7 +1133,7 @@ int ff_h264_decode_ref_pic_marking(H264SliceContext *sl, GetBitContext *gb,
                     if (long_arg >= 32 ||
                         (long_arg >= 16 && !(opcode == MMCO_SET_MAX_LONG &&
                                              long_arg == 16) &&
-                         !(opcode == MMCO_LONG2UNUSED && FIELD_PICTURE(sl)))) {
+                         !(opcode == MMCO_LONG2UNUSED && sl->picture_structure != PICT_FRAME))) {
                         av_log(logctx, AV_LOG_ERROR,
                                "illegal long ref in memory management control "
                                "operation %d\n", opcode);
