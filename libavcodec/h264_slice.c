@@ -438,8 +438,8 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
     memcpy(&h->poc,          &h1->poc,          sizeof(h->poc));
     memcpy(&h->dep_view_poc, &h1->dep_view_poc, sizeof(h->dep_view_poc));
 
-    memcpy(h->short_ref,   h1->short_ref,   sizeof(h->short_ref));
-    memcpy(h->long_ref,    h1->long_ref,    sizeof(h->long_ref));
+    memcpy(h->view->short_ref,   h1->view->short_ref,   sizeof(h->view->short_ref));
+    memcpy(h->view->long_ref,    h1->view->long_ref,    sizeof(h->view->long_ref));
     memcpy(h->delayed_pic, h1->delayed_pic, sizeof(h->delayed_pic));
     memcpy(h->last_pocs,   h1->last_pocs,   sizeof(h->last_pocs));
     memcpy(h->delayed_pic_dep, h1->delayed_pic_dep, sizeof(h->delayed_pic_dep));
@@ -450,13 +450,13 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
     h->next_outputed_poc_dep = h1->next_outputed_poc_dep;
     h->poc_offset        = h1->poc_offset;
 
-    h->long_ref_count  = h1->long_ref_count;
-    h->short_ref_count = h1->short_ref_count;
+    h->view->long_ref_count  = h1->view->long_ref_count;
+    h->view->short_ref_count = h1->view->short_ref_count;
     h->cur_view_id     = h1->cur_view_id;
     h->mvc_active      = h1->mvc_active;
 
-    copy_picture_range(h->short_ref, h1->short_ref, 32, h, h1);
-    copy_picture_range(h->long_ref, h1->long_ref, 32, h, h1);
+    copy_picture_range(h->view->short_ref, h1->view->short_ref, 32, h, h1);
+    copy_picture_range(h->view->long_ref, h1->view->long_ref, 32, h, h1);
     copy_picture_range(h->delayed_pic, h1->delayed_pic,
                        FF_ARRAY_ELEMS(h->delayed_pic), h, h1);
     copy_picture_range(h->delayed_pic_dep, h1->delayed_pic_dep,
@@ -1570,7 +1570,7 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
 
     while (poc->frame_num != poc->prev_frame_num && !h->view->first_field &&
            poc->frame_num != (poc->prev_frame_num + 1) % (1 << sps->log2_max_frame_num)) {
-        const H264Picture *prev = h->short_ref_count ? h->short_ref[0] : NULL;
+        const H264Picture *prev = h->view->short_ref_count ? h->view->short_ref[0] : NULL;
         av_log(h->avctx, AV_LOG_DEBUG, "Frame num gap %d %d\n",
                poc->frame_num, poc->prev_frame_num);
         if (!sps->gaps_in_frame_num_allowed_flag) {
@@ -1604,7 +1604,7 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
          * FIXME: This does not copy padding for out-of-frame motion
          * vectors.  Given we are concealing a lost frame, this probably
          * is not noticeable by comparison, but it should be fixed. */
-        if (h->short_ref_count) {
+        if (h->view->short_ref_count) {
             int c[4] = {
                 1<<(h->ps.sps->bit_depth_luma-1),
                 1<<(h->ps.sps->bit_depth_chroma-1),
@@ -1613,28 +1613,28 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
             };
 
             if (prev &&
-                h->short_ref[0]->f->width == prev->f->width &&
-                h->short_ref[0]->f->height == prev->f->height &&
-                h->short_ref[0]->f->format == prev->f->format) {
+                h->view->short_ref[0]->f->width == prev->f->width &&
+                h->view->short_ref[0]->f->height == prev->f->height &&
+                h->view->short_ref[0]->f->format == prev->f->format) {
                 ff_thread_await_progress(&prev->tf, INT_MAX, 0);
                 if (prev->field_picture)
                     ff_thread_await_progress(&prev->tf, INT_MAX, 1);
-                ff_thread_release_ext_buffer(&h->short_ref[0]->tf);
-                h->short_ref[0]->tf.f = h->short_ref[0]->f;
-                ret = ff_thread_ref_frame(&h->short_ref[0]->tf, &prev->tf);
+                ff_thread_release_ext_buffer(&h->view->short_ref[0]->tf);
+                h->view->short_ref[0]->tf.f = h->view->short_ref[0]->f;
+                ret = ff_thread_ref_frame(&h->view->short_ref[0]->tf, &prev->tf);
                 if (ret < 0)
                     return ret;
-                h->short_ref[0]->poc = prev->poc + 2U;
-                h->short_ref[0]->gray = prev->gray;
-                ff_thread_report_progress(&h->short_ref[0]->tf, INT_MAX, 0);
-                if (h->short_ref[0]->field_picture)
-                    ff_thread_report_progress(&h->short_ref[0]->tf, INT_MAX, 1);
+                h->view->short_ref[0]->poc = prev->poc + 2U;
+                h->view->short_ref[0]->gray = prev->gray;
+                ff_thread_report_progress(&h->view->short_ref[0]->tf, INT_MAX, 0);
+                if (h->view->short_ref[0]->field_picture)
+                    ff_thread_report_progress(&h->view->short_ref[0]->tf, INT_MAX, 1);
             } else if (!h->frame_recovered) {
                 if (!h->avctx->hwaccel)
-                    color_frame(h->short_ref[0]->f, c);
-                h->short_ref[0]->gray = 1;
+                    color_frame(h->view->short_ref[0]->f, c);
+                h->view->short_ref[0]->gray = 1;
             }
-            h->short_ref[0]->frame_num = poc->prev_frame_num;
+            h->view->short_ref[0]->frame_num = poc->prev_frame_num;
         }
     }
 
@@ -2081,14 +2081,14 @@ static int h264_slice_init(H264Context *h, H264SliceContext *sl,
                 sl->ref_list[j][i].parent->f->buf[0]) {
                 int k;
                 const AVBuffer *buf = sl->ref_list[j][i].parent->f->buf[0]->buffer;
-                for (k = 0; k < h->short_ref_count; k++)
-                    if (h->short_ref[k]->f->buf[0]->buffer == buf) {
+                for (k = 0; k < h->view->short_ref_count; k++)
+                    if (h->view->short_ref[k]->f->buf[0]->buffer == buf) {
                         id_list[i] = k;
                         break;
                     }
-                for (k = 0; k < h->long_ref_count; k++)
-                    if (h->long_ref[k] && h->long_ref[k]->f->buf[0]->buffer == buf) {
-                        id_list[i] = h->short_ref_count + k;
+                for (k = 0; k < h->view->long_ref_count; k++)
+                    if (h->view->long_ref[k] && h->view->long_ref[k]->f->buf[0]->buffer == buf) {
+                        id_list[i] = h->view->short_ref_count + k;
                         break;
                     }
             }

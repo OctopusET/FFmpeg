@@ -77,8 +77,8 @@ static void vdpau_h264_set_reference_frames(AVCodecContext *avctx)
 #define H264_RF_COUNT FF_ARRAY_ELEMS(info->referenceFrames)
 
     for (list = 0; list < 2; ++list) {
-        H264Picture **lp = list ? h->long_ref : h->short_ref;
-        int i, ls    = list ? 16          : h->short_ref_count;
+        H264Picture **lp = list ? h->view->long_ref : h->view->short_ref;
+        int i, ls    = list ? 16          : h->view->short_ref_count;
 
         for (i = 0; i < ls; ++i) {
             H264Picture *pic = lp[i];

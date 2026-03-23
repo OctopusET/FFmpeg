@@ -118,11 +118,11 @@ static int nvdec_h264_start_frame(AVCodecContext *avctx,
     memcpy(ppc->WeightScale8x8[1], pps->scaling_matrix8[3], sizeof(ppc->WeightScale8x8[0]));
 
     dpb_size = 0;
-    for (i = 0; i < h->short_ref_count; i++)
-        dpb_add(h, &ppc->dpb[dpb_size++], h->short_ref[i], h->short_ref[i]->frame_num);
+    for (i = 0; i < h->view->short_ref_count; i++)
+        dpb_add(h, &ppc->dpb[dpb_size++], h->view->short_ref[i], h->view->short_ref[i]->frame_num);
     for (i = 0; i < 16; i++) {
-        if (h->long_ref[i])
-            dpb_add(h, &ppc->dpb[dpb_size++], h->long_ref[i], i);
+        if (h->view->long_ref[i])
+            dpb_add(h, &ppc->dpb[dpb_size++], h->view->long_ref[i], i);
     }
 
     for (i = dpb_size; i < FF_ARRAY_ELEMS(ppc->dpb); i++)

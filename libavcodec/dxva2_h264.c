@@ -63,12 +63,12 @@ void ff_dxva2_h264_fill_picture_parameters(const AVCodecContext *avctx, AVDXVACo
     pp->NonExistingFrameFlags  = 0;
     for (i = 0, j = 0; i < FF_ARRAY_ELEMS(pp->RefFrameList); i++) {
         const H264Picture *r;
-        if (j < h->short_ref_count) {
-            r = h->short_ref[j++];
+        if (j < h->view->short_ref_count) {
+            r = h->view->short_ref[j++];
         } else {
             r = NULL;
-            while (!r && j < h->short_ref_count + 16)
-                r = h->long_ref[j++ - h->short_ref_count];
+            while (!r && j < h->view->short_ref_count + 16)
+                r = h->view->long_ref[j++ - h->view->short_ref_count];
         }
         if (r) {
             fill_picture_entry(&pp->RefFrameList[i],

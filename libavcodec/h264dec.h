@@ -371,6 +371,12 @@ typedef struct H264ViewContext {
 
     int current_slice;
     int nb_slice_ctx_queued;
+
+    H264Picture *short_ref[32];
+    H264Picture *long_ref[32];
+    int short_ref_count;
+    int long_ref_count;
+
     int has_slice;
 } H264ViewContext;
 
@@ -499,8 +505,6 @@ typedef struct H264Context {
     H264POCContext dep_view_poc;
 
     H264Ref default_ref[2];
-    H264Picture *short_ref[32];
-    H264Picture *long_ref[32];
     H264Picture *delayed_pic[H264_MAX_DPB_FRAMES + 2]; // FIXME size?
     int last_pocs[H264_MAX_DPB_FRAMES];
     H264Picture *next_output_pic;
@@ -511,8 +515,6 @@ typedef struct H264Context {
     int next_outputed_poc_dep;
     int poc_offset;         ///< PicOrderCnt_offset from SMPTE RDD-2006
 
-    int long_ref_count;     ///< number of actual long term references
-    int short_ref_count;    ///< number of actual short term references
 
     /**
      * Complement sei_pic_struct
@@ -603,7 +605,7 @@ typedef struct H264Context {
      *
      * Architecture: single-DPB with view_id tagging.
      *
-     * Both views share DPB[36] and short_ref[]/long_ref[] arrays.
+     * Both views share DPB[36].  short_ref[]/long_ref[] are per-view.
      * Each H264Picture is tagged with view_id so ref list construction
      * (h264_refs.c) filters by view_id before building lists.
      * Inter-view references are added explicitly from the base view

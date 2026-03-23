@@ -143,14 +143,14 @@ static int fill_vaapi_ReferenceFrames(VAPictureParameterBufferH264 *pic_param,
     for (i = 0; i < dpb.max_size; i++)
         init_vaapi_pic(&dpb.va_pics[i]);
 
-    for (i = 0; i < h->short_ref_count; i++) {
-        const H264Picture *pic = h->short_ref[i];
+    for (i = 0; i < h->view->short_ref_count; i++) {
+        const H264Picture *pic = h->view->short_ref[i];
         if (pic && pic->reference && dpb_add(&dpb, pic) < 0)
             return -1;
     }
 
     for (i = 0; i < 16; i++) {
-        const H264Picture *pic = h->long_ref[i];
+        const H264Picture *pic = h->view->long_ref[i];
         if (pic && pic->reference && dpb_add(&dpb, pic) < 0)
             return -1;
     }
