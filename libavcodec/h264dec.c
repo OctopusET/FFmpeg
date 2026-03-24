@@ -1007,6 +1007,9 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             h->cur_view_id = get_bits(&nal->gb, 10);
             skip_bits(&nal->gb, 6);            // temporal_id(3), anchor(1), inter_view(1), reserved(1)
 
+            if (!h->mvc_detected)
+                h->mvc_detected = 1;
+
             /* Register view IDs for discovery (view specifiers) without
              * activating MVC decode.  mvc_active is only set after
              * confirming the view is requested by the user. */
@@ -1073,8 +1076,18 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                     ff_h264_execute_decode_slices(h);
                     h->view->nb_slice_ctx_queued = 0;
                 }
-                if (!(avctx->flags2 & AV_CODEC_FLAG2_CHUNKS))
+                if (!(avctx->flags2 & AV_CODEC_FLAG2_CHUNKS)) {
                     ff_h264_field_end(h, &h->slice_ctx[0], 0);
+                    if (h->next_output_pic) {
+                        ret = finalize_frame(h, h->next_output_pic);
+                        h->next_output_pic = NULL;
+                        if (ret < 0) goto end;
+                    }
+                    /* Mark base picture done so h264_decode_packet's
+                     * field_end doesn't double-process it. */
+                    h->view->cur_pic_ptr = NULL;
+                    h->view->current_slice = 0;
+                }
                 h264_set_view(h, 1);
             }
 
@@ -1263,7 +1276,7 @@ static int output_frame(H264Context *h, AVFrame *dst, H264Picture *srcp)
         av_frame_remove_side_data(dst, AV_FRAME_DATA_FILM_GRAIN_PARAMS);
 
     /* MVC: attach view_id and stereo3d side data */
-    if (h->mvc_active) {
+    if (h->mvc_detected) {
         AVFrameSideData *sd = av_frame_side_data_new(
             &dst->side_data, &dst->nb_side_data,
             AV_FRAME_DATA_VIEW_ID, sizeof(int), 0);
