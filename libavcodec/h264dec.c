@@ -1067,27 +1067,15 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             if (!non_idr_flag)
                 h->has_recovery_point = 1;
 
-            /* Combined packets (parser kept base+dep together): base
-             * slices are already queued (current_slice > 0).  Execute
-             * them, finalize the base picture, and switch to dep view
-             * so the dep slice gets its own first_slice=1 init. */
-            if (h->cur_view == 0 && h->view->current_slice > 0) {
-                if (h->view->nb_slice_ctx_queued) {
-                    ff_h264_execute_decode_slices(h);
-                    h->view->nb_slice_ctx_queued = 0;
-                }
-                if (!(avctx->flags2 & AV_CODEC_FLAG2_CHUNKS)) {
-                    ff_h264_field_end(h, &h->slice_ctx[0], 0);
-                    if (h->next_output_pic) {
-                        h->next_output_pic->recovered |= h->frame_recovered;
-                        ret = finalize_frame(h, h->next_output_pic);
-                        h->next_output_pic = NULL;
-                        if (ret < 0) goto end;
-                    }
-                    h->view->cur_pic_ptr = NULL;
-                }
-                h264_set_view(h, 1);
-            }
+            /* Combined packets: skip dep slice if base slices are
+             * already queued.  The dep NALs are split and queued by
+             * h264_receive_frame for accumulate-and-drain.
+             * For drain packets (current_slice == 0), decode normally. */
+            if (h->cur_view == 0 && h->view->current_slice > 0)
+                break;
+
+            if (!h->mvc_active)
+                h->mvc_active = 1;
 
             h->view->has_slice = 1;
             goto slice_common;
@@ -1114,21 +1102,6 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
     ret = ff_h264_execute_decode_slices(h);
     if (ret < 0 && (h->avctx->err_recognition & AV_EF_EXPLODE))
         goto end;
-
-    /* Combined packets: finalize dep view and switch back to base */
-    if (h->cur_view == 1) {
-        if (h->view->cur_pic_ptr && h->view->has_slice) {
-            int fret = ff_h264_field_end(h, &h->slice_ctx[0], 0);
-            if (fret < 0 && ret >= 0)
-                ret = fret;
-            if (h->next_output_pic) {
-                fret = finalize_frame(h, h->next_output_pic);
-                if (fret < 0 && ret >= 0)
-                    ret = fret;
-            }
-        }
-        h264_set_view(h, 0);
-    }
 
     // set decode_error_flags to allow users to detect concealed decoding errors
     if ((ret < 0 || h->er.error_occurred) && h->view->cur_pic_ptr) {
@@ -1597,6 +1570,33 @@ static int h264_is_dep_view_packet(const uint8_t *buf, int buf_size)
 }
 
 /**
+ * Find the start of the MVC dep view section in a combined Annex B packet.
+ * Returns the byte offset of the first dep NAL start code, or -1.
+ */
+static int h264_find_dep_section(const uint8_t *buf, int buf_size)
+{
+    for (int i = 0; i + 3 < buf_size; ) {
+        int sc_start, nal_start;
+
+        if (buf[i] || buf[i + 1]) { i++; continue; }
+        sc_start = i;
+        if (buf[i + 2] == 1) nal_start = i + 3;
+        else if (buf[i + 2] == 0 && i + 3 < buf_size && buf[i + 3] == 1) nal_start = i + 4;
+        else { i++; continue; }
+        if (nal_start >= buf_size) break;
+
+        switch (buf[nal_start] & 0x1F) {
+        case H264_NAL_SUB_SPS:
+        case H264_NAL_PREFIX:
+        case H264_NAL_EXTEN_SLICE:
+            return sc_start;
+        }
+        i = nal_start + 1;
+    }
+    return -1;
+}
+
+/**
  * Drain all accumulated dep-view packets from the pending list.
  *
  * In MPEG-TS with merged MVC PIDs, dep view PES packets often arrive
@@ -1745,6 +1745,38 @@ get_packet:
 
         if (ret < 0)
             return ret;
+    }
+
+    /* Combined packets: split dep portion and queue for drain.
+     * The base portion is decoded normally by h264_decode_packet.
+     * The dep portion is queued in mvc_pending_pkts and drained
+     * before the NEXT base packet (standard accumulate-and-drain). */
+    if (h->nb_view_ids && !h->is_avc) {
+        int dep_off = h264_find_dep_section(avpkt->data, avpkt->size);
+        if (dep_off > 0 && dep_off < avpkt->size) {
+            AVPacket *dep_pkt = av_packet_alloc();
+            if (!dep_pkt)
+                return AVERROR(ENOMEM);
+            dep_pkt->buf  = av_buffer_ref(avpkt->buf);
+            if (!dep_pkt->buf) {
+                av_packet_free(&dep_pkt);
+                return AVERROR(ENOMEM);
+            }
+            dep_pkt->data         = avpkt->data + dep_off;
+            dep_pkt->size         = avpkt->size - dep_off;
+            dep_pkt->pts          = avpkt->pts;
+            dep_pkt->dts          = avpkt->dts;
+            dep_pkt->stream_index = avpkt->stream_index;
+            dep_pkt->flags        = avpkt->flags;
+            if (!h->mvc_detected)
+                h->mvc_detected = 1;
+            ret = avpriv_packet_list_put(&h->mvc_pending_pkts, dep_pkt, NULL, 0);
+            av_packet_free(&dep_pkt);
+            if (ret < 0)
+                return ret;
+            h->mvc_pending_count++;
+            avpkt->size = dep_off;
+        }
     }
 
     ret = h264_decode_packet(h, avpkt);
