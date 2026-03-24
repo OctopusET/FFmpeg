@@ -1079,14 +1079,12 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                 if (!(avctx->flags2 & AV_CODEC_FLAG2_CHUNKS)) {
                     ff_h264_field_end(h, &h->slice_ctx[0], 0);
                     if (h->next_output_pic) {
+                        h->next_output_pic->recovered |= h->frame_recovered;
                         ret = finalize_frame(h, h->next_output_pic);
                         h->next_output_pic = NULL;
                         if (ret < 0) goto end;
                     }
-                    /* Mark base picture done so h264_decode_packet's
-                     * field_end doesn't double-process it. */
                     h->view->cur_pic_ptr = NULL;
-                    h->view->current_slice = 0;
                 }
                 h264_set_view(h, 1);
             }
