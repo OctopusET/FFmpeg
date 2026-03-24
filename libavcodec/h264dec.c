@@ -1064,6 +1064,20 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             if (!non_idr_flag)
                 h->has_recovery_point = 1;
 
+            /* Combined packets (parser kept base+dep together): base
+             * slices are already queued (current_slice > 0).  Execute
+             * them, finalize the base picture, and switch to dep view
+             * so the dep slice gets its own first_slice=1 init. */
+            if (h->cur_view == 0 && h->view->current_slice > 0) {
+                if (h->view->nb_slice_ctx_queued) {
+                    ff_h264_execute_decode_slices(h);
+                    h->view->nb_slice_ctx_queued = 0;
+                }
+                if (!(avctx->flags2 & AV_CODEC_FLAG2_CHUNKS))
+                    ff_h264_field_end(h, &h->slice_ctx[0], 0);
+                h264_set_view(h, 1);
+            }
+
             h->view->has_slice = 1;
             goto slice_common;
         }
@@ -1089,6 +1103,21 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
     ret = ff_h264_execute_decode_slices(h);
     if (ret < 0 && (h->avctx->err_recognition & AV_EF_EXPLODE))
         goto end;
+
+    /* Combined packets: finalize dep view and switch back to base */
+    if (h->cur_view == 1) {
+        if (h->view->cur_pic_ptr && h->view->has_slice) {
+            int fret = ff_h264_field_end(h, &h->slice_ctx[0], 0);
+            if (fret < 0 && ret >= 0)
+                ret = fret;
+            if (h->next_output_pic) {
+                fret = finalize_frame(h, h->next_output_pic);
+                if (fret < 0 && ret >= 0)
+                    ret = fret;
+            }
+        }
+        h264_set_view(h, 0);
+    }
 
     // set decode_error_flags to allow users to detect concealed decoding errors
     if ((ret < 0 || h->er.error_occurred) && h->view->cur_pic_ptr) {
