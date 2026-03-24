@@ -1747,27 +1747,28 @@ get_packet:
             return ret;
     }
 
-    /* Combined packets: split dep portion and queue for drain.
-     * The base portion is decoded normally by h264_decode_packet.
-     * The dep portion is queued in mvc_pending_pkts and drained
-     * before the NEXT base packet (standard accumulate-and-drain). */
+    /* MVC: extract dep view data from side data (attached by demuxer
+     * after PES-level absorption).  Queue for accumulate-and-drain. */
     if (h->nb_view_ids && !h->is_avc) {
-        int dep_off = h264_find_dep_section(avpkt->data, avpkt->size);
-        if (dep_off > 0 && dep_off < avpkt->size) {
+        size_t dep_size;
+        uint8_t *dep_data = av_packet_get_side_data(avpkt,
+                                AV_PKT_DATA_H264_MVC_DEP, &dep_size);
+        if (dep_data && dep_size > 0) {
             AVPacket *dep_pkt = av_packet_alloc();
             if (!dep_pkt)
                 return AVERROR(ENOMEM);
-            dep_pkt->buf  = av_buffer_ref(avpkt->buf);
+            dep_pkt->buf = av_buffer_alloc(dep_size + AV_INPUT_BUFFER_PADDING_SIZE);
             if (!dep_pkt->buf) {
                 av_packet_free(&dep_pkt);
                 return AVERROR(ENOMEM);
             }
-            dep_pkt->data         = avpkt->data + dep_off;
-            dep_pkt->size         = avpkt->size - dep_off;
+            memcpy(dep_pkt->buf->data, dep_data, dep_size);
+            memset(dep_pkt->buf->data + dep_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+            dep_pkt->data         = dep_pkt->buf->data;
+            dep_pkt->size         = dep_size;
             dep_pkt->pts          = avpkt->pts;
             dep_pkt->dts          = avpkt->dts;
             dep_pkt->stream_index = avpkt->stream_index;
-            dep_pkt->flags        = avpkt->flags;
             if (!h->mvc_detected)
                 h->mvc_detected = 1;
             ret = avpriv_packet_list_put(&h->mvc_pending_pkts, dep_pkt, NULL, 0);
@@ -1775,7 +1776,6 @@ get_packet:
             if (ret < 0)
                 return ret;
             h->mvc_pending_count++;
-            avpkt->size = dep_off;
         }
     }
 

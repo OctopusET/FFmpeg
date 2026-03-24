@@ -3601,6 +3601,20 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
     if (!ret && pkt->size < 0)
         ret = AVERROR_INVALIDDATA;
 
+    /* MVC: attach absorbed dep PES data as side data on base packet.
+     * This bypasses the parser entirely.  The H.264 decoder extracts
+     * it in h264_receive_frame for accumulate-and-drain. */
+    if (!ret && pkt->size > 0 && ts->mvc_dep_buf && ts->mvc_dep_size > 0 &&
+        ts->mvc_base_st_index >= 0 && pkt->stream_index == ts->mvc_base_st_index) {
+        uint8_t *sd = av_packet_new_side_data(pkt, AV_PKT_DATA_H264_MVC_DEP,
+                                               ts->mvc_dep_size);
+        if (sd) {
+            memcpy(sd, ts->mvc_dep_buf->data, ts->mvc_dep_size);
+            av_buffer_unref(&ts->mvc_dep_buf);
+            ts->mvc_dep_size = 0;
+        }
+    }
+
     return ret;
 }
 
