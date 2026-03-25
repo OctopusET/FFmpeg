@@ -184,8 +184,8 @@ struct MpegTSContext {
     AVBufferPool* pools[32];
 
     /** MVC dep PES FIFO -- absorbed dep PES queued for side data delivery */
-    AVBufferRef *mvc_dep_fifo[16];
-    int mvc_dep_fifo_size[16];
+    AVBufferRef *mvc_dep_fifo[32];
+    int mvc_dep_fifo_size[32];
     int mvc_dep_fifo_count;
     uint8_t *mvc_dep_extra;
     int mvc_dep_extra_size;
@@ -1199,7 +1199,7 @@ static void mvc_buffer_dep_pes(MpegTSContext *ts, PESContext *pes,
             ts->mvc_dep_fifo[idx] = combined;
             ts->mvc_dep_fifo_size[idx] = new_size;
         }
-    } else if (ts->mvc_dep_fifo_count < 16) {
+    } else if (ts->mvc_dep_fifo_count < 32) {
         /* New FIFO entry (completed PES from is_start) */
         int idx = ts->mvc_dep_fifo_count++;
         av_buffer_unref(&ts->mvc_dep_fifo[idx]);
@@ -1228,7 +1228,7 @@ static int mpegts_push_data(MpegTSFilter *filter,
 
     if (is_start) {
         if (pes->state == MPEGTS_PAYLOAD && pes->data_index > 0) {
-            if (ts->mvc_dep_pid && !ts->mvc_dep_deliver && pes->pid == ts->mvc_dep_pid) {
+            if (ts->mvc_dep_pid && pes->pid == ts->mvc_dep_pid) {
                 av_log(ts->stream, AV_LOG_DEBUG,
                        "MVC: buffering dep PES pid=0x%x size=%d\n",
                        pes->pid, pes->data_index);
@@ -1490,9 +1490,10 @@ skip:
 
                 if (pes->data_index > 0 &&
                     pes->data_index + buf_size > max_packet_size) {
-                    if (ts->mvc_dep_pid && !ts->mvc_dep_deliver && pes->pid == ts->mvc_dep_pid) {
-                        /* Dep PES overflow: expand buffer to accumulate
-                         * complete PES for is_start capture. */
+                    if (ts->mvc_dep_pid &&
+                        pes->pid == ts->mvc_dep_pid) {
+                        /* MVC dep PES overflow: expand buffer to
+                         * accumulate complete PES for FIFO capture. */
                         int new_max = pes->data_index + buf_size + 204800;
                         AVBufferRef *newbuf = av_buffer_alloc(new_max + AV_INPUT_BUFFER_PADDING_SIZE);
                         if (newbuf) {
@@ -1529,8 +1530,8 @@ skip:
                  * a couple of seconds to milliseconds for properly muxed files. */
                 if (!ts->stop_parse && pes->PES_packet_length &&
                     pes->pes_header_size + pes->data_index == pes->PES_packet_length + PES_START_SIZE) {
-                    if (ts->mvc_dep_pid && !ts->mvc_dep_deliver && pes->pid == ts->mvc_dep_pid) {
-                        mvc_buffer_dep_pes(ts, pes, 1);
+                    if (ts->mvc_dep_pid && pes->pid == ts->mvc_dep_pid) {
+                        mvc_buffer_dep_pes(ts, pes, 0);
                     } else {
                         ts->stop_parse = 1;
                         ret = new_pes_packet(pes, ts->pkt);
@@ -3601,6 +3602,13 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
             if (ts->pids[i] && ts->pids[i]->type == MPEGTS_PES) {
                 PESContext *pes = ts->pids[i]->u.pes_filter.opaque;
                 if (pes->state == MPEGTS_PAYLOAD && pes->data_index > 0) {
+                    /* Absorb dep PES at EOF too */
+                    if (ts->mvc_dep_pid &&
+                        pes->pid == ts->mvc_dep_pid) {
+                        mvc_buffer_dep_pes(ts, pes, 0);
+                        pes->state = MPEGTS_SKIP;
+                        continue;
+                    }
                     ret = new_pes_packet(pes, pkt);
                     if (ret < 0)
                         return ret;
@@ -3615,10 +3623,10 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
         ret = AVERROR_INVALIDDATA;
 
     /* MVC: attach absorbed dep PES data as side data on base packet.
-     * Pop the oldest entry from the FIFO. */
+     * Flush all available FIFO entries as one blob. */
     if (!ret && pkt->size > 0 && ts->mvc_dep_fifo_count > 0 &&
         ts->mvc_base_st_index >= 0 && pkt->stream_index == ts->mvc_base_st_index) {
-        /* One-time: scan FIFO for SUB_SPS+PPS to prepend as dep extradata */
+        /* One-time: extract dep extradata (SUB_SPS+PPS) from FIFO */
         if (!ts->mvc_dep_extra) {
             for (int fi = 0; fi < ts->mvc_dep_fifo_count; fi++) {
                 const uint8_t *d = ts->mvc_dep_fifo[fi]->data;
@@ -3645,22 +3653,13 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
                 ts->mvc_dep_extra_size = 0;
             }
         }
-        /* Merge consecutive FIFO entries that belong to the same PES
-         * (overflow split: second entry lacks Annex B start code). */
-        int merged_size = ts->mvc_dep_fifo_size[0];
-        int merge_count = 1;
-        while (merge_count < ts->mvc_dep_fifo_count) {
-            const uint8_t *next = ts->mvc_dep_fifo[merge_count]->data;
-            int next_sz = ts->mvc_dep_fifo_size[merge_count];
-            /* Check for Annex B start code at beginning */
-            if (next_sz >= 4 && next[0] == 0 && next[1] == 0 &&
-                (next[2] == 1 || (next[2] == 0 && next[3] == 1)))
-                break; /* new PES, don't merge */
-            merged_size += next_sz;
-            merge_count++;
-        }
 
-        /* Only prepend dep extradata once, then clear it */
+        /* Flush all available FIFO entries as one side data blob */
+        int merged_size = 0;
+        int merge_count = ts->mvc_dep_fifo_count;
+        for (int j = 0; j < merge_count; j++)
+            merged_size += ts->mvc_dep_fifo_size[j];
+
         int extra = ts->mvc_dep_extra_size;
         int dep_size = merged_size + extra;
         uint8_t *sd = av_packet_new_side_data(pkt, AV_PKT_DATA_H264_MVC_DEP,
@@ -3677,13 +3676,12 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
                 off += ts->mvc_dep_fifo_size[mi];
                 av_buffer_unref(&ts->mvc_dep_fifo[mi]);
             }
-            /* Shift FIFO down */
             ts->mvc_dep_fifo_count -= merge_count;
             memmove(&ts->mvc_dep_fifo[0], &ts->mvc_dep_fifo[merge_count],
                     ts->mvc_dep_fifo_count * sizeof(ts->mvc_dep_fifo[0]));
             memmove(&ts->mvc_dep_fifo_size[0], &ts->mvc_dep_fifo_size[merge_count],
                     ts->mvc_dep_fifo_count * sizeof(ts->mvc_dep_fifo_size[0]));
-            for (int mi = ts->mvc_dep_fifo_count; mi < 16; mi++)
+            for (int mi = ts->mvc_dep_fifo_count; mi < 32; mi++)
                 ts->mvc_dep_fifo[mi] = NULL;
         }
     }
