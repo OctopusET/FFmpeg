@@ -1173,15 +1173,41 @@ static AVBufferRef *buffer_pool_get(MpegTSContext *ts, int size)
 /**
  * Buffer dep PES data for MVC combining instead of delivering.
  */
-static void mvc_buffer_dep_pes(MpegTSContext *ts, PESContext *pes)
+/**
+ * Buffer dep PES data.  For is_start (new PES header), this stores
+ * the PREVIOUS completed PES as a new FIFO entry.  For overflow and
+ * PES_packet_length paths, the data is a partial PES that should be
+ * concatenated with the previous FIFO entry (same PES, split by
+ * max_packet_size).
+ */
+static void mvc_buffer_dep_pes(MpegTSContext *ts, PESContext *pes,
+                               int is_continuation)
 {
-    if (ts->mvc_dep_fifo_count < 16) {
+    if (is_continuation && ts->mvc_dep_fifo_count > 0) {
+        /* Append to latest FIFO entry (same PES, overflow split) */
+        int idx = ts->mvc_dep_fifo_count - 1;
+        int old_size = ts->mvc_dep_fifo_size[idx];
+        int new_size = old_size + pes->data_index;
+        AVBufferRef *combined = av_buffer_alloc(new_size + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (combined) {
+            memcpy(combined->data, ts->mvc_dep_fifo[idx]->data, old_size);
+            memcpy(combined->data + old_size, pes->buffer->data, pes->data_index);
+            memset(combined->data + new_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+            av_buffer_unref(&ts->mvc_dep_fifo[idx]);
+            ts->mvc_dep_fifo[idx] = combined;
+            ts->mvc_dep_fifo_size[idx] = new_size;
+        }
+    } else if (ts->mvc_dep_fifo_count < 16) {
+        /* New FIFO entry (completed PES from is_start) */
         int idx = ts->mvc_dep_fifo_count++;
         av_buffer_unref(&ts->mvc_dep_fifo[idx]);
         ts->mvc_dep_fifo[idx]      = pes->buffer;
         ts->mvc_dep_fifo_size[idx] = pes->data_index;
         pes->buffer = NULL;
+        reset_pes_packet_state(pes);
+        return;
     }
+    /* For continuation: don't steal buffer, just reset state */
     reset_pes_packet_state(pes);
 }
 
@@ -1204,7 +1230,7 @@ static int mpegts_push_data(MpegTSFilter *filter,
                 av_log(ts->stream, AV_LOG_DEBUG,
                        "MVC: buffering dep PES pid=0x%x size=%d\n",
                        pes->pid, pes->data_index);
-                mvc_buffer_dep_pes(ts, pes);
+                mvc_buffer_dep_pes(ts, pes, 0);
             } else {
                 ret = new_pes_packet(pes, ts->pkt);
                 if (ret < 0)
@@ -1463,7 +1489,7 @@ skip:
                 if (pes->data_index > 0 &&
                     pes->data_index + buf_size > max_packet_size) {
                     if (ts->mvc_dep_pid && !ts->mvc_dep_deliver && pes->pid == ts->mvc_dep_pid) {
-                        mvc_buffer_dep_pes(ts, pes);
+                        mvc_buffer_dep_pes(ts, pes, 1);
                     } else {
                         ret = new_pes_packet(pes, ts->pkt);
                         if (ret < 0)
@@ -1493,7 +1519,7 @@ skip:
                 if (!ts->stop_parse && pes->PES_packet_length &&
                     pes->pes_header_size + pes->data_index == pes->PES_packet_length + PES_START_SIZE) {
                     if (ts->mvc_dep_pid && !ts->mvc_dep_deliver && pes->pid == ts->mvc_dep_pid) {
-                        mvc_buffer_dep_pes(ts, pes);
+                        mvc_buffer_dep_pes(ts, pes, 1);
                     } else {
                         ts->stop_parse = 1;
                         ret = new_pes_packet(pes, ts->pkt);
