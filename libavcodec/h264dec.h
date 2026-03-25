@@ -376,8 +376,6 @@ typedef struct H264ViewContext {
     int current_slice;
     int nb_slice_ctx_queued;
 
-    H264Picture DPB[H264_MAX_PICTURE_COUNT];
-
     H264Picture *short_ref[32];
     H264Picture *long_ref[32];
     int short_ref_count;
@@ -401,6 +399,8 @@ typedef struct H264Context {
     H264ViewContext  views[2];   ///< [0]=base, [1]=dep; non-MVC uses [0] only
     H264ViewContext *view;       ///< cached pointer to views[cur_view]
     int              cur_view;   ///< active view index (0=base, 1=dep)
+
+    H264Picture DPB[H264_MAX_PICTURE_COUNT];
 
 
     H264SliceContext *slice_ctx;

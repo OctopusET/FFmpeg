@@ -222,10 +222,10 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
         if (!iv_ref) {
             /* Search base view DPB (views[0]) for inter-view ref */
             for (int i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
-                if (h->views[0].DPB[i].f->buf[0] &&
-                    h->views[0].DPB[i].view_id == 0 &&
-                    h->views[0].DPB[i].frame_num == cur_frame_num) {
-                    iv_ref = &h->views[0].DPB[i];
+                if (h->DPB[i].f->buf[0] &&
+                    h->DPB[i].view_id == 0 &&
+                    h->DPB[i].frame_num == cur_frame_num) {
+                    iv_ref = &h->DPB[i];
                     break;
                 }
             }
@@ -474,10 +474,10 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                 if (i < 0) {
                     /* Search base view DPB for inter-view ref */
                     for (int j = 0; j < H264_MAX_PICTURE_COUNT; j++) {
-                        if (h->views[0].DPB[j].f->buf[0] &&
-                            h->views[0].DPB[j].view_id != h->cur_view_id &&
-                            h->views[0].DPB[j].frame_num == cur_frame_num) {
-                            ref = &h->views[0].DPB[j];
+                        if (h->DPB[j].f->buf[0] &&
+                            h->DPB[j].view_id != h->cur_view_id &&
+                            h->DPB[j].frame_num == cur_frame_num) {
+                            ref = &h->DPB[j];
                             pic_id = ref->pic_id;
                             i = 0;
                             break;

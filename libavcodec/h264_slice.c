@@ -120,9 +120,9 @@ static void release_unused_pictures(H264Context *h, int remove_current)
 
     /* release non reference frames */
     for (i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
-        if (h->view->DPB[i].f->buf[0] && !h->view->DPB[i].reference &&
-            (remove_current || &h->view->DPB[i] != h->view->cur_pic_ptr)) {
-            ff_h264_unref_picture(&h->view->DPB[i]);
+        if (h->DPB[i].f->buf[0] && !h->DPB[i].reference &&
+            (remove_current || &h->DPB[i] != h->view->cur_pic_ptr)) {
+            ff_h264_unref_picture(&h->DPB[i]);
         }
     }
 }
@@ -277,7 +277,7 @@ static int find_unused_picture(const H264Context *h)
     int i;
 
     for (i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
-        if (!h->view->DPB[i].f->buf[0])
+        if (!h->DPB[i].f->buf[0])
             return i;
     }
     return AVERROR_INVALIDDATA;
@@ -287,9 +287,9 @@ static int find_unused_picture(const H264Context *h)
 #define IN_RANGE(a, b, size) (((void*)(a) >= (void*)(b)) && ((void*)(a) < (void*)((b) + (size))))
 
 #define REBASE_PICTURE(pic, new_ctx, old_ctx)             \
-    (((pic) && (pic) >= (old_ctx)->view->DPB &&                       \
-      (pic) < (old_ctx)->view->DPB + H264_MAX_PICTURE_COUNT) ?          \
-     &(new_ctx)->view->DPB[(pic) - (old_ctx)->view->DPB] : NULL)
+    (((pic) && (pic) >= (old_ctx)->DPB &&                       \
+      (pic) < (old_ctx)->DPB + H264_MAX_PICTURE_COUNT) ?          \
+     &(new_ctx)->DPB[(pic) - (old_ctx)->DPB] : NULL)
 
 static void copy_picture_range(H264Picture **to, H264Picture *const *from, int count,
                                H264Context *new_base, const H264Context *old_base)
@@ -398,7 +398,7 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
     h->mb_aff_frame         = h1->mb_aff_frame;
 
     for (i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
-        ret = ff_h264_replace_picture(&h->view->DPB[i], &h1->view->DPB[i]);
+        ret = ff_h264_replace_picture(&h->DPB[i], &h1->DPB[i]);
         if (ret < 0)
             return ret;
     }
@@ -521,7 +521,7 @@ static int h264_frame_start(H264Context *h)
         av_log(h->avctx, AV_LOG_ERROR, "no frame buffer available\n");
         return i;
     }
-    pic = &h->view->DPB[i];
+    pic = &h->DPB[i];
 
     pic->reference              = h->view->droppable ? 0 : h->view->picture_structure;
     pic->field_picture          = h->view->picture_structure != PICT_FRAME;

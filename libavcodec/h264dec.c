@@ -337,7 +337,7 @@ static int h264_init_context(AVCodecContext *avctx, H264Context *h)
     /* Init both views' DPB, cur_pic, last_pic_for_ec */
     for (int v = 0; v < 2; v++) {
         for (i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
-            if ((ret = h264_init_pic(&h->views[v].DPB[i])) < 0)
+            if ((ret = h264_init_pic(&h->DPB[i])) < 0)
                 return ret;
         }
         if ((ret = h264_init_pic(&h->views[v].cur_pic)) < 0)
@@ -369,7 +369,7 @@ static av_cold int h264_decode_end(AVCodecContext *avctx)
 
     for (int v = 0; v < 2; v++) {
         for (i = 0; i < H264_MAX_PICTURE_COUNT; i++)
-            h264_free_pic(h, &h->views[v].DPB[i]);
+            h264_free_pic(h, &h->DPB[i]);
         h264_free_pic(h, &h->views[v].cur_pic);
         h264_free_pic(h, &h->views[v].last_pic_for_ec);
         h->views[v].cur_pic_ptr = NULL;
@@ -570,7 +570,7 @@ static av_cold void h264_decode_flush(AVCodecContext *avctx)
     ff_h264_sei_uninit(&h->sei);
 
     for (i = 0; i < H264_MAX_PICTURE_COUNT; i++)
-        ff_h264_unref_picture(&h->view->DPB[i]);
+        ff_h264_unref_picture(&h->DPB[i]);
     h->view->cur_pic_ptr = NULL;
     ff_h264_unref_picture(&h->view->cur_pic);
 
@@ -1050,7 +1050,7 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
              * by the IDR and must be skipped.  The dep anchor
              * (non_idr_flag=0) starts the new dep-view GOP and clears
              * the flag. */
-            if (h->mvc_base_idr_decoded && non_idr_flag)
+            if (h->mvc_base_idr_decoded && non_idr_flag && h->cur_view == 0)
                 break;
             if (!non_idr_flag)
                 h->mvc_base_idr_decoded = 0;
@@ -1569,32 +1569,7 @@ static int h264_is_dep_view_packet(const uint8_t *buf, int buf_size)
     return has_dep;
 }
 
-/**
- * Find the start of the MVC dep view section in a combined Annex B packet.
- * Returns the byte offset of the first dep NAL start code, or -1.
- */
-static int h264_find_dep_section(const uint8_t *buf, int buf_size)
-{
-    for (int i = 0; i + 3 < buf_size; ) {
-        int sc_start, nal_start;
 
-        if (buf[i] || buf[i + 1]) { i++; continue; }
-        sc_start = i;
-        if (buf[i + 2] == 1) nal_start = i + 3;
-        else if (buf[i + 2] == 0 && i + 3 < buf_size && buf[i + 3] == 1) nal_start = i + 4;
-        else { i++; continue; }
-        if (nal_start >= buf_size) break;
-
-        switch (buf[nal_start] & 0x1F) {
-        case H264_NAL_SUB_SPS:
-        case H264_NAL_PREFIX:
-        case H264_NAL_EXTEN_SLICE:
-            return sc_start;
-        }
-        i = nal_start + 1;
-    }
-    return -1;
-}
 
 /**
  * Drain all accumulated dep-view packets from the pending list.
