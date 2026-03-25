@@ -186,6 +186,7 @@ struct MpegTSContext {
     /** MVC dep PES data buffered for combining with base */
     AVBufferRef *mvc_dep_buf;
     int mvc_dep_size;
+    int64_t mvc_dep_dts;
     int mvc_dep_pid;        ///< dep PID for detection, 0 if not MVC
     int mvc_dep_deliver;    ///< 1: deliver dep PES (MVC 3D), 0: absorb (default)
     int mvc_base_st_index;  ///< base H.264 stream index, -1 if unset
@@ -1177,6 +1178,7 @@ static void mvc_buffer_dep_pes(MpegTSContext *ts, PESContext *pes)
     av_buffer_unref(&ts->mvc_dep_buf);
     ts->mvc_dep_buf  = pes->buffer;
     ts->mvc_dep_size = pes->data_index;
+    ts->mvc_dep_dts  = pes->dts;
     pes->buffer = NULL;
     reset_pes_packet_state(pes);
 }
