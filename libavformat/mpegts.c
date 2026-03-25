@@ -1491,15 +1491,24 @@ skip:
                 if (pes->data_index > 0 &&
                     pes->data_index + buf_size > max_packet_size) {
                     if (ts->mvc_dep_pid && !ts->mvc_dep_deliver && pes->pid == ts->mvc_dep_pid) {
-                        mvc_buffer_dep_pes(ts, pes, 1);
+                        /* Dep PES overflow: expand buffer to accumulate
+                         * complete PES for is_start capture. */
+                        int new_max = pes->data_index + buf_size + 204800;
+                        AVBufferRef *newbuf = av_buffer_alloc(new_max + AV_INPUT_BUFFER_PADDING_SIZE);
+                        if (newbuf) {
+                            memcpy(newbuf->data, pes->buffer->data, pes->data_index);
+                            av_buffer_unref(&pes->buffer);
+                            pes->buffer = newbuf;
+                        }
+                        max_packet_size = new_max;
                     } else {
                         ret = new_pes_packet(pes, ts->pkt);
                         if (ret < 0)
                             return ret;
+                        pes->PES_packet_length = 0;
+                        max_packet_size = ts->max_packet_size;
                         ts->stop_parse = 1;
                     }
-                    pes->PES_packet_length = 0;
-                    max_packet_size = ts->max_packet_size;
                 } else if (pes->data_index == 0 &&
                            buf_size > max_packet_size) {
                     // pes packet size is < ts size packet and pes data is padded with STUFFING_BYTE
