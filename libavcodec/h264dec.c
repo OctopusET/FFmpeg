@@ -1705,6 +1705,7 @@ get_packet:
         }
 
         h264_set_view(h, 1);  /* switch to dep view context */
+        h->er.error_occurred = 0;  /* reset ER state for dep view */
 
         ret = h264_drain_mvc_pending(h);
 
@@ -1714,6 +1715,7 @@ get_packet:
         }
 
         h264_set_view(h, 0);  /* switch back to base view */
+        h->er.error_occurred = 0;  /* reset ER state for base view */
         av_refstruct_replace(&h->ps.pps, save_pps);
         h->ps.sps = h->ps.pps ? h->ps.pps->sps : NULL;
         av_refstruct_unref(&save_pps);
