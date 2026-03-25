@@ -187,6 +187,8 @@ struct MpegTSContext {
     AVBufferRef *mvc_dep_fifo[16];
     int mvc_dep_fifo_size[16];
     int mvc_dep_fifo_count;
+    uint8_t *mvc_dep_extra;
+    int mvc_dep_extra_size;
     int mvc_dep_pid;        ///< dep PID for detection, 0 if not MVC
     int mvc_dep_deliver;    ///< 1: deliver dep PES (MVC 3D), 0: absorb (default)
     int mvc_base_st_index;  ///< base H.264 stream index, -1 if unset
@@ -3607,19 +3609,73 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
      * Pop the oldest entry from the FIFO. */
     if (!ret && pkt->size > 0 && ts->mvc_dep_fifo_count > 0 &&
         ts->mvc_base_st_index >= 0 && pkt->stream_index == ts->mvc_base_st_index) {
-        int dep_size = ts->mvc_dep_fifo_size[0];
+        /* One-time: scan FIFO for SUB_SPS+PPS to prepend as dep extradata */
+        if (!ts->mvc_dep_extra) {
+            for (int fi = 0; fi < ts->mvc_dep_fifo_count; fi++) {
+                const uint8_t *d = ts->mvc_dep_fifo[fi]->data;
+                int sz = ts->mvc_dep_fifo_size[fi];
+                for (int k = 0; k + 4 < sz; k++) {
+                    if (d[k]==0 && d[k+1]==0 && d[k+2]==0 && d[k+3]==1 &&
+                        (d[k+4] & 0x1f) == 15) {
+                        int end = sz;
+                        for (int m = k+5; m + 4 < sz; m++)
+                            if (d[m]==0 && d[m+1]==0 && d[m+2]==0 && d[m+3]==1 &&
+                                ((d[m+4]&0x1f)==20 || (d[m+4]&0x1f)==6))
+                                { end = m; break; }
+                        ts->mvc_dep_extra_size = end - k;
+                        ts->mvc_dep_extra = av_malloc(ts->mvc_dep_extra_size);
+                        if (ts->mvc_dep_extra)
+                            memcpy(ts->mvc_dep_extra, d + k, ts->mvc_dep_extra_size);
+                        break;
+                    }
+                }
+                if (ts->mvc_dep_extra) break;
+            }
+            if (!ts->mvc_dep_extra) {
+                ts->mvc_dep_extra = av_malloc(1);
+                ts->mvc_dep_extra_size = 0;
+            }
+        }
+        /* Merge consecutive FIFO entries that belong to the same PES
+         * (overflow split: second entry lacks Annex B start code). */
+        int merged_size = ts->mvc_dep_fifo_size[0];
+        int merge_count = 1;
+        while (merge_count < ts->mvc_dep_fifo_count) {
+            const uint8_t *next = ts->mvc_dep_fifo[merge_count]->data;
+            int next_sz = ts->mvc_dep_fifo_size[merge_count];
+            /* Check for Annex B start code at beginning */
+            if (next_sz >= 4 && next[0] == 0 && next[1] == 0 &&
+                (next[2] == 1 || (next[2] == 0 && next[3] == 1)))
+                break; /* new PES, don't merge */
+            merged_size += next_sz;
+            merge_count++;
+        }
+
+        /* Only prepend dep extradata once, then clear it */
+        int extra = ts->mvc_dep_extra_size;
+        int dep_size = merged_size + extra;
         uint8_t *sd = av_packet_new_side_data(pkt, AV_PKT_DATA_H264_MVC_DEP,
                                                dep_size);
         if (sd) {
-            memcpy(sd, ts->mvc_dep_fifo[0]->data, dep_size);
-            av_buffer_unref(&ts->mvc_dep_fifo[0]);
+            int off = 0;
+            if (extra) {
+                memcpy(sd, ts->mvc_dep_extra, extra);
+                off = extra;
+            }
+            for (int mi = 0; mi < merge_count; mi++) {
+                memcpy(sd + off, ts->mvc_dep_fifo[mi]->data,
+                       ts->mvc_dep_fifo_size[mi]);
+                off += ts->mvc_dep_fifo_size[mi];
+                av_buffer_unref(&ts->mvc_dep_fifo[mi]);
+            }
             /* Shift FIFO down */
-            ts->mvc_dep_fifo_count--;
-            memmove(&ts->mvc_dep_fifo[0], &ts->mvc_dep_fifo[1],
+            ts->mvc_dep_fifo_count -= merge_count;
+            memmove(&ts->mvc_dep_fifo[0], &ts->mvc_dep_fifo[merge_count],
                     ts->mvc_dep_fifo_count * sizeof(ts->mvc_dep_fifo[0]));
-            memmove(&ts->mvc_dep_fifo_size[0], &ts->mvc_dep_fifo_size[1],
+            memmove(&ts->mvc_dep_fifo_size[0], &ts->mvc_dep_fifo_size[merge_count],
                     ts->mvc_dep_fifo_count * sizeof(ts->mvc_dep_fifo_size[0]));
-            ts->mvc_dep_fifo[ts->mvc_dep_fifo_count] = NULL;
+            for (int mi = ts->mvc_dep_fifo_count; mi < 16; mi++)
+                ts->mvc_dep_fifo[mi] = NULL;
         }
     }
 
@@ -3642,6 +3698,7 @@ static void mpegts_free(MpegTSContext *ts)
     for (int j = 0; j < ts->mvc_dep_fifo_count; j++)
         av_buffer_unref(&ts->mvc_dep_fifo[j]);
     ts->mvc_dep_fifo_count = 0;
+    av_freep(&ts->mvc_dep_extra);
 }
 
 static int mpegts_read_close(AVFormatContext *s)

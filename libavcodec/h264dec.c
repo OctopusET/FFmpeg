@@ -1729,6 +1729,24 @@ get_packet:
         uint8_t *dep_data = av_packet_get_side_data(avpkt,
                                 AV_PKT_DATA_H264_MVC_DEP, &dep_size);
         if (dep_data && dep_size > 0) {
+            /* One-time: parse dep SPS/PPS from side data */
+            if (!h->ps.sps_list[1]) {
+                H2645Packet tp = { 0 };
+                if (ff_h2645_packet_split(&tp, dep_data, dep_size,
+                                           avctx, 0, AV_CODEC_ID_H264, 0) >= 0) {
+                    for (int j = 0; j < tp.nb_nals; j++)
+                        if (tp.nals[j].type == H264_NAL_SUB_SPS) {
+                            GetBitContext gb = tp.nals[j].gb;
+                            ff_h264_decode_seq_parameter_set(&gb, avctx, &h->ps, 0);
+                        }
+                    if (h->ps.sps_list[1])
+                        for (int j = 0; j < tp.nb_nals; j++)
+                            if (tp.nals[j].type == H264_NAL_PPS)
+                                ff_h264_decode_picture_parameter_set(&tp.nals[j].gb,
+                                    avctx, &h->ps, tp.nals[j].size_bits);
+                }
+                ff_h2645_packet_uninit(&tp);
+            }
             AVPacket *dep_pkt = av_packet_alloc();
             if (!dep_pkt)
                 return AVERROR(ENOMEM);
