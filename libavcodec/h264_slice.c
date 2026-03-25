@@ -2721,7 +2721,8 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
     sl->is_complex = FRAME_MBAFF(h) || h->view->picture_structure != PICT_FRAME ||
                      (CONFIG_GRAY && (h->flags & AV_CODEC_FLAG_GRAY));
 
-    if (!(h->avctx->active_thread_type & FF_THREAD_SLICE) && h->view->picture_structure == PICT_FRAME && sl->er->error_status_table) {
+    if (!(h->avctx->active_thread_type & FF_THREAD_SLICE) && h->enable_er &&
+        h->view->picture_structure == PICT_FRAME && sl->er->error_status_table) {
         const int start_i  = av_clip(sl->resync_mb_x + sl->resync_mb_y * h->mb_width, 0, h->mb_num - 1);
         if (start_i) {
             int prev_status = sl->er->error_status_table[sl->er->mb_index2xy[start_i - 1]];
