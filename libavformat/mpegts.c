@@ -3605,7 +3605,13 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
                     /* Absorb dep PES at EOF too */
                     if (ts->mvc_dep_pid &&
                         pes->pid == ts->mvc_dep_pid) {
-                        mvc_buffer_dep_pes(ts, pes, 0);
+                        /* Only buffer complete dep PES at EOF.
+                         * Partial PES (truncated by stream end)
+                         * would cause decode errors. */
+                        if (pes->PES_packet_length &&
+                            pes->pes_header_size + pes->data_index >=
+                            pes->PES_packet_length + PES_START_SIZE)
+                            mvc_buffer_dep_pes(ts, pes, 0);
                         pes->state = MPEGTS_SKIP;
                         continue;
                     }
@@ -3637,7 +3643,8 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
                         int end = sz;
                         for (int m = k+5; m + 4 < sz; m++)
                             if (d[m]==0 && d[m+1]==0 && d[m+2]==0 && d[m+3]==1 &&
-                                ((d[m+4]&0x1f)==20 || (d[m+4]&0x1f)==6))
+                                ((d[m+4]&0x1f)==20 || (d[m+4]&0x1f)==6 ||
+                                 (d[m+4]&0x1f)>=24))
                                 { end = m; break; }
                         ts->mvc_dep_extra_size = end - k;
                         ts->mvc_dep_extra = av_malloc(ts->mvc_dep_extra_size);
