@@ -183,10 +183,10 @@ struct MpegTSContext {
     AVStream *epg_stream;
     AVBufferPool* pools[32];
 
-    /** MVC dep PES data buffered for combining with base */
-    AVBufferRef *mvc_dep_buf;
-    int mvc_dep_size;
-    int64_t mvc_dep_dts;
+    /** MVC dep PES FIFO -- absorbed dep PES queued for side data delivery */
+    AVBufferRef *mvc_dep_fifo[16];
+    int mvc_dep_fifo_size[16];
+    int mvc_dep_fifo_count;
     int mvc_dep_pid;        ///< dep PID for detection, 0 if not MVC
     int mvc_dep_deliver;    ///< 1: deliver dep PES (MVC 3D), 0: absorb (default)
     int mvc_base_st_index;  ///< base H.264 stream index, -1 if unset
@@ -1175,40 +1175,14 @@ static AVBufferRef *buffer_pool_get(MpegTSContext *ts, int size)
  */
 static void mvc_buffer_dep_pes(MpegTSContext *ts, PESContext *pes)
 {
-    av_buffer_unref(&ts->mvc_dep_buf);
-    ts->mvc_dep_buf  = pes->buffer;
-    ts->mvc_dep_size = pes->data_index;
-    ts->mvc_dep_dts  = pes->dts;
-    pes->buffer = NULL;
+    if (ts->mvc_dep_fifo_count < 16) {
+        int idx = ts->mvc_dep_fifo_count++;
+        av_buffer_unref(&ts->mvc_dep_fifo[idx]);
+        ts->mvc_dep_fifo[idx]      = pes->buffer;
+        ts->mvc_dep_fifo_size[idx] = pes->data_index;
+        pes->buffer = NULL;
+    }
     reset_pes_packet_state(pes);
-}
-
-/**
- * Append buffered MVC dep data to a base PES packet.
- */
-static int mvc_append_dep_to_pkt(MpegTSContext *ts, AVPacket *pkt)
-{
-    int base_size = pkt->size;
-    int dep_size  = ts->mvc_dep_size;
-    int total     = base_size + dep_size;
-    AVBufferRef *combined;
-
-    combined = av_buffer_alloc(total + AV_INPUT_BUFFER_PADDING_SIZE);
-    if (!combined)
-        return AVERROR(ENOMEM);
-
-    memcpy(combined->data, pkt->data, base_size);
-    memcpy(combined->data + base_size, ts->mvc_dep_buf->data, dep_size);
-    memset(combined->data + total, 0, AV_INPUT_BUFFER_PADDING_SIZE);
-
-    av_buffer_unref(&pkt->buf);
-    pkt->buf  = combined;
-    pkt->data = combined->data;
-    pkt->size = total;
-
-    av_buffer_unref(&ts->mvc_dep_buf);
-    ts->mvc_dep_size = 0;
-    return 0;
 }
 
 /* return non zero if a packet could be constructed */
@@ -3604,16 +3578,22 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
         ret = AVERROR_INVALIDDATA;
 
     /* MVC: attach absorbed dep PES data as side data on base packet.
-     * This bypasses the parser entirely.  The H.264 decoder extracts
-     * it in h264_receive_frame for accumulate-and-drain. */
-    if (!ret && pkt->size > 0 && ts->mvc_dep_buf && ts->mvc_dep_size > 0 &&
+     * Pop the oldest entry from the FIFO. */
+    if (!ret && pkt->size > 0 && ts->mvc_dep_fifo_count > 0 &&
         ts->mvc_base_st_index >= 0 && pkt->stream_index == ts->mvc_base_st_index) {
+        int dep_size = ts->mvc_dep_fifo_size[0];
         uint8_t *sd = av_packet_new_side_data(pkt, AV_PKT_DATA_H264_MVC_DEP,
-                                               ts->mvc_dep_size);
+                                               dep_size);
         if (sd) {
-            memcpy(sd, ts->mvc_dep_buf->data, ts->mvc_dep_size);
-            av_buffer_unref(&ts->mvc_dep_buf);
-            ts->mvc_dep_size = 0;
+            memcpy(sd, ts->mvc_dep_fifo[0]->data, dep_size);
+            av_buffer_unref(&ts->mvc_dep_fifo[0]);
+            /* Shift FIFO down */
+            ts->mvc_dep_fifo_count--;
+            memmove(&ts->mvc_dep_fifo[0], &ts->mvc_dep_fifo[1],
+                    ts->mvc_dep_fifo_count * sizeof(ts->mvc_dep_fifo[0]));
+            memmove(&ts->mvc_dep_fifo_size[0], &ts->mvc_dep_fifo_size[1],
+                    ts->mvc_dep_fifo_count * sizeof(ts->mvc_dep_fifo_size[0]));
+            ts->mvc_dep_fifo[ts->mvc_dep_fifo_count] = NULL;
         }
     }
 
@@ -3633,7 +3613,9 @@ static void mpegts_free(MpegTSContext *ts)
         if (ts->pids[i])
             mpegts_close_filter(ts, ts->pids[i]);
 
-    av_buffer_unref(&ts->mvc_dep_buf);
+    for (int j = 0; j < ts->mvc_dep_fifo_count; j++)
+        av_buffer_unref(&ts->mvc_dep_fifo[j]);
+    ts->mvc_dep_fifo_count = 0;
 }
 
 static int mpegts_read_close(AVFormatContext *s)
