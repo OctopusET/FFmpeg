@@ -3654,11 +3654,11 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
             }
         }
 
-        /* Flush all available FIFO entries as one side data blob */
-        int merged_size = 0;
-        int merge_count = ts->mvc_dep_fifo_count;
-        for (int j = 0; j < merge_count; j++)
-            merged_size += ts->mvc_dep_fifo_size[j];
+        /* Pop one FIFO entry per base packet.  Each dep frame is decoded
+         * after its corresponding base frame, ensuring the inter-view
+         * reference is available in the DPB. */
+        int merged_size = ts->mvc_dep_fifo_size[0];
+        int merge_count = 1;
 
         int extra = ts->mvc_dep_extra_size;
         int dep_size = merged_size + extra;

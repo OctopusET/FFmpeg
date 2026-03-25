@@ -1241,36 +1241,6 @@ static int parse_packet(AVFormatContext *s, AVPacket *pkt,
                 }
                 memcpy(dst_data, src_sd->data, src_sd->size);
             }
-        } else if (pkt->side_data && out_pkt->side_data && !pkt_side_data_consumed) {
-            /* out_pkt retained side data from a previous non-output call.
-             * Merge current input's side data: concatenate same-type entries
-             * to preserve data from both inputs. */
-            for (int i = 0; i < pkt->side_data_elems; i++) {
-                const AVPacketSideData *const src_sd = &pkt->side_data[i];
-                int existing_idx = -1;
-                for (int j = 0; j < out_pkt->side_data_elems; j++)
-                    if (out_pkt->side_data[j].type == src_sd->type) {
-                        existing_idx = j;
-                        break;
-                    }
-                if (existing_idx >= 0) {
-                    AVPacketSideData *e = &out_pkt->side_data[existing_idx];
-                    int new_sz = e->size + src_sd->size;
-                    uint8_t *merged = av_realloc(e->data,
-                        new_sz + AV_INPUT_BUFFER_PADDING_SIZE);
-                    if (merged) {
-                        memcpy(merged + e->size, src_sd->data, src_sd->size);
-                        memset(merged + new_sz, 0, AV_INPUT_BUFFER_PADDING_SIZE);
-                        e->data = merged;
-                        e->size = new_sz;
-                    }
-                } else {
-                    uint8_t *dst = av_packet_new_side_data(out_pkt,
-                        src_sd->type, src_sd->size);
-                    if (dst)
-                        memcpy(dst, src_sd->data, src_sd->size);
-                }
-            }
         }
 
         if (!out_pkt->size)

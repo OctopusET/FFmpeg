@@ -1699,20 +1699,28 @@ get_packet:
     if (!avctx->internal->is_frame_mt && h->mvc_pending_pkts.head) {
         const PPS *save_pps = av_refstruct_ref_c(h->ps.pps);
 
-        if (h->view->cur_pic_ptr && !h->view->cur_pic_ptr->view_id) {
+        /* Protect ALL base view frames in the DPB during dep drain.
+         * The drain may decode dep frames from multiple access units,
+         * each needing its own base frame as inter-view reference.
+         * Without protection, find_unused_picture could recycle base
+         * frame slots while dep frames still need them. */
+        for (int i = 0; i < H264_MAX_PICTURE_COUNT; i++)
+            if (h->DPB[i].f->buf[0] && h->DPB[i].view_id == 0)
+                h->DPB[i].reference |= MVC_IV_REF;
+
+        if (h->view->cur_pic_ptr && !h->view->cur_pic_ptr->view_id)
             h->mvc_base_pic = h->view->cur_pic_ptr;
-            h->mvc_base_pic->reference |= MVC_IV_REF;
-        }
 
         h264_set_view(h, 1);  /* switch to dep view context */
         h->er.error_occurred = 0;  /* reset ER state for dep view */
 
         ret = h264_drain_mvc_pending(h);
 
-        if (h->mvc_base_pic) {
-            h->mvc_base_pic->reference &= ~MVC_IV_REF;
-            h->mvc_base_pic = NULL;
-        }
+        /* Unprotect base frames and clear mvc_base_pic */
+        for (int i = 0; i < H264_MAX_PICTURE_COUNT; i++)
+            if (h->DPB[i].f->buf[0] && h->DPB[i].view_id == 0)
+                h->DPB[i].reference &= ~MVC_IV_REF;
+        h->mvc_base_pic = NULL;
 
         h264_set_view(h, 0);  /* switch back to base view */
         h->er.error_occurred = 0;  /* reset ER state for base view */
