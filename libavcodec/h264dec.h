@@ -28,10 +28,12 @@
 #ifndef AVCODEC_H264DEC_H
 #define AVCODEC_H264DEC_H
 
+#include "libavutil/container_fifo.h"
 #include "libavutil/mem_internal.h"
 
 #include "cabac.h"
 #include "error_resilience.h"
+#include "packet_internal.h"
 #include "h264_parse.h"
 #include "h264_ps.h"
 #include "h264_sei.h"
@@ -62,7 +64,7 @@
 #define MB_MBAFF(h)    (h)->mb_mbaff
 #define MB_FIELD(sl)  (sl)->mb_field_decoding_flag
 #define FRAME_MBAFF(h) (h)->mb_aff_frame
-#define FIELD_PICTURE(h) ((h)->picture_structure != PICT_FRAME)
+#define FIELD_PICTURE(h) ((h)->view->picture_structure != PICT_FRAME)
 #define LEFT_MBS 2
 #define LTOP     0
 #define LBOT     1
@@ -147,6 +149,14 @@ typedef struct H264Picture {
  * when the picture is held for delayed output.
  */
 #define DELAYED_PIC_REF  (1 << 2)
+/**
+ * H264Picture.reference has this flag set while the picture is needed
+ * as an inter-view reference for MVC dependent view decoding.
+ * Set in h264_receive_frame() before draining dep view packets,
+ * cleared after draining.  Prevents MMCO/sliding window from freeing
+ * the base view picture while dep view slices still need it.
+ */
+#define MVC_IV_REF       (1 << 3)
     int reference;
     int recovered;          ///< picture at IDR or recovery point + recovery count
     int invalid_gap;
@@ -162,6 +172,12 @@ typedef struct H264Picture {
     atomic_int *decode_error_flags;
 
     int gray;
+
+    int view_id;            ///< MVC view identifier (0=base, >0=dependent)
+    /** For dep view frames: index into views[0].DPB of the base view
+     *  frame from the same access unit.  -1 if not available.
+     *  Used for inter-view prediction (MVC Annex H). */
+    int base_view_frame;
 } H264Picture;
 
 typedef struct H264Ref {
@@ -333,6 +349,44 @@ typedef struct H264SliceContext {
 } H264SliceContext;
 
 /**
+ * Per-view decoder state for H.264 MVC (Multiview Video Coding).
+ *
+ * Isolates fields that must be independent per view during MVC
+ * dependent view drain.  For non-MVC, only views[0] is used.
+ */
+typedef struct H264ViewContext {
+    H264Picture *cur_pic_ptr;
+    H264Picture  cur_pic;
+    H264Picture  last_pic_for_ec;
+
+    int first_field;
+    int picture_structure;
+    int droppable;
+
+    int idr_pic_flag;
+    int nal_ref_idc;
+    int nal_unit_type;
+    int picture_idr;
+
+    MMCO mmco[H264_MAX_MMCO_COUNT];
+    int  nb_mmco;
+    int  mmco_reset;
+    int  explicit_ref_marking;
+
+    int current_slice;
+    int nb_slice_ctx_queued;
+
+    H264Picture *short_ref[32];
+    H264Picture *long_ref[32];
+    int short_ref_count;
+    int long_ref_count;
+
+    H264Picture DPB[H264_MAX_PICTURE_COUNT];
+
+    int has_slice;
+} H264ViewContext;
+
+/**
  * H264Context
  */
 typedef struct H264Context {
@@ -343,14 +397,12 @@ typedef struct H264Context {
     H264ChromaContext h264chroma;
     H264QpelContext h264qpel;
 
-    H264Picture DPB[H264_MAX_PICTURE_COUNT];
-    H264Picture *cur_pic_ptr;
-    H264Picture cur_pic;
-    H264Picture last_pic_for_ec;
+    H264ViewContext  views[2];   ///< [0]=base, [1]=dep; non-MVC uses [0] only
+    H264ViewContext *view;       ///< cached pointer to views[cur_view]
+    int              cur_view;   ///< active view index (0=base, 1=dep)
 
     H264SliceContext *slice_ctx;
     int            nb_slice_ctx;
-    int            nb_slice_ctx_queued;
 
     H2645Packet pkt;
 
@@ -359,8 +411,6 @@ typedef struct H264Context {
     /* coded dimensions -- 16 * mb w/h */
     int width, height;
     int chroma_x_shift, chroma_y_shift;
-
-    int droppable;
 
     int context_initialized;
     int flags;
@@ -371,11 +421,6 @@ typedef struct H264Context {
      * during normal MB decoding and execute it serially at the end.
      */
     int postpone_filter;
-
-    /*
-     * Set to 1 when the current picture is IDR, 0 otherwise.
-     */
-    int picture_idr;
 
     /*
      * Set to 1 when the current picture contains only I slices, 0 otherwise.
@@ -408,8 +453,6 @@ typedef struct H264Context {
 
     // interlacing specific flags
     int mb_aff_frame;
-    int picture_structure;
-    int first_field;
 
     uint8_t *list_counts;               ///< Array of list_count per MB specifying the slice type
 
@@ -443,11 +486,6 @@ typedef struct H264Context {
     // =============================================================
     // Things below are not used in the MB or more inner code
 
-    int nal_ref_idc;
-    int nal_unit_type;
-
-    int has_slice;          ///< slice NAL is found in the packet, set by decode_nal_units, its state does not need to be preserved outside h264_decode_frame()
-
     /**
      * Used to parse AVC variant of H.264
      */
@@ -463,36 +501,24 @@ typedef struct H264Context {
 
     H264POCContext poc;
 
+    /**
+     * Per-view POC context for MVC dependent view (view_id > 0).
+     * Each view tracks POC state independently. Selected via:
+     *   H264POCContext *poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
+     */
+    H264POCContext dep_view_poc;
+
     H264Ref default_ref[2];
-    H264Picture *short_ref[32];
-    H264Picture *long_ref[32];
     H264Picture *delayed_pic[H264_MAX_DPB_FRAMES + 2]; // FIXME size?
     int last_pocs[H264_MAX_DPB_FRAMES];
     H264Picture *next_output_pic;
     int next_outputed_poc;
+    /** MVC dep view: separate reorder buffer so per-view POC ordering works */
+    H264Picture *delayed_pic_dep[H264_MAX_DPB_FRAMES + 2];
+    int last_pocs_dep[H264_MAX_DPB_FRAMES];
+    int next_outputed_poc_dep;
     int poc_offset;         ///< PicOrderCnt_offset from SMPTE RDD-2006
 
-    /**
-     * memory management control operations buffer.
-     */
-    MMCO mmco[H264_MAX_MMCO_COUNT];
-    int  nb_mmco;
-    int mmco_reset;
-    int explicit_ref_marking;
-
-    int long_ref_count;     ///< number of actual long term references
-    int short_ref_count;    ///< number of actual short term references
-
-    /**
-     * @name Members for slice based multithreading
-     * @{
-     */
-    /**
-     * current slice number, used to initialize slice_num of each thread/context
-     */
-    int current_slice;
-
-    /** @} */
 
     /**
      * Complement sei_pic_struct
@@ -577,7 +603,76 @@ typedef struct H264Context {
     int non_gray;                       ///< Did we encounter a intra frame after a gray gap frame
     int noref_gray;
     int skip_gray;
+
+    /**
+     * @name MVC (Multiview Video Coding) state -- H.264 Annex H
+     *
+     * Architecture: single-DPB with view_id tagging.
+     *
+     * Both views share DPB[36].  short_ref[]/long_ref[] are per-view.
+     * Each H264Picture is tagged with view_id so ref list construction
+     * (h264_refs.c) filters by view_id before building lists.
+     * Inter-view references are added explicitly from the base view
+     * picture with matching frame_num (see h264_initialise_ref_list()).
+     *
+     * POC state (prev_poc_msb/lsb, frame_num, etc.) is tracked per-view
+     * via H264Context.poc (base) and H264Context.dep_view_poc (dependent).
+     * Selected with: h->cur_view_id ? &h->dep_view_poc : &h->poc.
+     *
+     * Output uses per-view reorder buffers (delayed_pic[] for base,
+     * delayed_pic_dep[] for dependent) so B-frame POC ordering within
+     * each view is independent.
+     *
+     * MPEG-TS demuxing: mpegts.c merges the dependent view PID
+     * (stream_type 0x20) onto the base H.264 stream (0x1B), so the
+     * decoder sees both views' NALs on a single AVStream.
+     *
+     * Packet reordering: MPEG-TS PES ordering often delivers dep view
+     * packets before the base view packet for the same access unit.
+     * h264_receive_frame() accumulates dep-view-only packets in
+     * mvc_pending_pkts and drains them after the base view packet,
+     * ensuring the inter-view reference picture is in the DPB.
+     *
+     * Threading: MVC requires single-thread or slice-thread mode.
+     * Frame threading is incompatible because each worker has a
+     * separate DPB, preventing inter-view prediction.
+     *
+     * @{
+     */
+    int cur_view_id;        ///< MVC view_id of current NAL (0=base)
+
+    AVContainerFifo *output_fifo;   ///< multi-frame output FIFO (MVC multiview)
+    int mvc_detected;               ///< 1 when MVC NALs seen (for suppression)
+    int mvc_active;                 ///< 1 when dep view decode is enabled
+    unsigned layers_active_decode;  ///< bitmask: bit i = view i decoded
+    unsigned layers_active_output;  ///< bitmask: bit i = view i output
+    int mvc_frame_thread_warned;    ///< log-once flag for frame thread warning
+    H264Picture *mvc_base_pic;      ///< base view picture for inter-view ref
+    int mvc_base_idr_decoded;       ///< base view IDR was decoded; stale dep slices must be skipped
+
+    /**
+     * Deferred dep view packets for MVC reordering.
+     * Dep view PES may arrive before base view; accumulated here and
+     * drained after the base view packet is decoded.
+     */
+    PacketList mvc_pending_pkts;
+    int mvc_pending_count;          ///< number of packets in mvc_pending_pkts
+    H264Picture *mvc_pending_output_pic; ///< base view output saved across view transition
+
+    int *view_ids;                  ///< user-requested view IDs (AVOption, -1=all)
+    unsigned nb_view_ids;
+    unsigned *view_ids_available;   ///< detected view IDs (exported AVOption)
+    unsigned nb_view_ids_available;
+    unsigned *view_pos_available;   ///< view positions for view_ids_available
+    unsigned nb_view_pos_available;
+    /** @} */
 } H264Context;
+
+static inline void h264_set_view(H264Context *h, int view_idx)
+{
+    h->cur_view = view_idx;
+    h->view     = &h->views[view_idx];
+}
 
 extern const uint16_t ff_h264_mb_sizes[4];
 
@@ -597,12 +692,22 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl);
 void ff_h264_remove_all_refs(H264Context *h);
 
 /**
+ * Remove all reference pictures belonging to a specific MVC view.
+ *
+ * Used by idr() in MVC mode: when a base view IDR arrives, only the
+ * base view refs should be cleared (the dep view's refs from a prior
+ * GOP are handled separately).  Also used for dep view anchors.
+ */
+void ff_h264_remove_view_refs(H264Context *h, int view_id);
+
+/**
  * Execute the reference picture marking (memory management control operations).
  */
 int ff_h264_execute_ref_pic_marking(H264Context *h);
 
 int ff_h264_decode_ref_pic_marking(H264SliceContext *sl, GetBitContext *gb,
-                                   const H2645NAL *nal, void *logctx);
+                                   const H2645NAL *nal, int idr_pic_flag,
+                                   void *logctx);
 
 void ff_h264_hl_decode_mb(const H264Context *h, H264SliceContext *sl);
 void ff_h264_decode_init_vlc(void);
