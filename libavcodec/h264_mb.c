@@ -66,8 +66,8 @@ static inline void get_lowest_part_y(const H264Context *h, H264SliceContext *sl,
         // Error resilience puts the current picture in the ref list.
         // Don't try to wait on these as it will cause a deadlock.
         // Fields can wait on each other, though.
-        if (ref->parent->tf.progress != h->cur_pic.tf.progress ||
-            (ref->reference & 3) != h->picture_structure) {
+        if (ref->parent->tf.progress != h->view->cur_pic.tf.progress ||
+            (ref->reference & 3) != h->view->picture_structure) {
             my = get_lowest_part_list_y(sl, n, height, y_offset, 0);
             if (refs[0][ref_n] < 0)
                 nrefs[0] += 1;
@@ -79,8 +79,8 @@ static inline void get_lowest_part_y(const H264Context *h, H264SliceContext *sl,
         int ref_n    = sl->ref_cache[1][scan8[n]];
         H264Ref *ref = &sl->ref_list[1][ref_n];
 
-        if (ref->parent->tf.progress != h->cur_pic.tf.progress ||
-            (ref->reference & 3) != h->picture_structure) {
+        if (ref->parent->tf.progress != h->view->cur_pic.tf.progress ||
+            (ref->reference & 3) != h->view->picture_structure) {
             my = get_lowest_part_list_y(sl, n, height, y_offset, 1);
             if (refs[1][ref_n] < 0)
                 nrefs[1] += 1;
@@ -97,7 +97,7 @@ static inline void get_lowest_part_y(const H264Context *h, H264SliceContext *sl,
 static void await_references(const H264Context *h, H264SliceContext *sl)
 {
     const int mb_xy   = sl->mb_xy;
-    const int mb_type = h->cur_pic.mb_type[mb_xy];
+    const int mb_type = h->view->cur_pic.mb_type[mb_xy];
     int16_t refs[2][48];
     int nrefs[2] = { 0 };
     int ref, list;
@@ -800,7 +800,7 @@ static av_always_inline void hl_decode_mb_idct_luma(const H264Context *h, H264Sl
 void ff_h264_hl_decode_mb(const H264Context *h, H264SliceContext *sl)
 {
     const int mb_xy   = sl->mb_xy;
-    const int mb_type = h->cur_pic.mb_type[mb_xy];
+    const int mb_type = h->view->cur_pic.mb_type[mb_xy];
     int is_complex    = CONFIG_SMALL || sl->is_complex ||
                         IS_INTRA_PCM(mb_type) || sl->qscale == 0;
 

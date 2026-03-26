@@ -372,6 +372,16 @@ enum AVPacketSideDataType {
      * The number of side data types.
      * This is not part of the public API/ABI in the sense that it may
      * change when new side data types are added.
+     */
+
+    /**
+     * MVC dependent view NAL data.  Carried as side data on the base
+     * view packet to bypass the parser.  The decoder extracts it for
+     * accumulate-and-drain dep view decoding.
+     */
+    AV_PKT_DATA_H264_MVC_DEP,
+
+    /**
      * This must stay the last enum value.
      * If its value becomes huge, some code using it
      * needs to be updated as it assumes it to be smaller than other limits.

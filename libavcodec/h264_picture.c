@@ -103,6 +103,7 @@ static void h264_copy_picture_params(H264Picture *dst, const H264Picture *src)
     dst->mb_height     = src->mb_height;
     dst->mb_stride     = src->mb_stride;
     dst->needs_fg      = src->needs_fg;
+    dst->view_id       = src->view_id;
 }
 
 int ff_h264_ref_picture(H264Picture *dst, const H264Picture *src)
@@ -189,18 +190,22 @@ void ff_h264_set_erpic(ERPicture *dst, const H264Picture *src)
 int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup)
 {
     AVCodecContext *const avctx = h->avctx;
-    H264Picture *cur = h->cur_pic_ptr;
+    H264Picture *cur = h->view->cur_pic_ptr;
     int err = 0;
     h->mb_y = 0;
 
     if (in_setup || !(avctx->active_thread_type & FF_THREAD_FRAME)) {
-        if (!h->droppable) {
+        /* MVC: each view tracks POC state independently.  Without this,
+         * the dep view's slice header overwrites prev_poc_msb/lsb, and
+         * the next base view slice computes POC from wrong state. */
+        H264POCContext *const poc = h->cur_view_id ? &h->dep_view_poc : &h->poc;
+        if (!h->view->droppable) {
             err = ff_h264_execute_ref_pic_marking(h);
-            h->poc.prev_poc_msb = h->poc.poc_msb;
-            h->poc.prev_poc_lsb = h->poc.poc_lsb;
+            poc->prev_poc_msb = poc->poc_msb;
+            poc->prev_poc_lsb = poc->poc_lsb;
         }
-        h->poc.prev_frame_num_offset = h->poc.frame_num_offset;
-        h->poc.prev_frame_num        = h->poc.frame_num;
+        poc->prev_frame_num_offset = poc->frame_num_offset;
+        poc->prev_frame_num        = poc->frame_num;
     }
 
     if (avctx->hwaccel) {
@@ -208,7 +213,7 @@ int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup)
         if (err < 0)
             av_log(avctx, AV_LOG_ERROR,
                    "hardware accelerator failed to decode picture\n");
-    } else if (!in_setup && cur->needs_fg && (!FIELD_PICTURE(h) || !h->first_field)) {
+    } else if (!in_setup && cur->needs_fg && (!FIELD_PICTURE(h) || !h->view->first_field)) {
         const AVFrameSideData *sd = av_frame_get_side_data(cur->f, AV_FRAME_DATA_FILM_GRAIN_PARAMS);
 
         err = AVERROR_INVALIDDATA;
@@ -223,12 +228,12 @@ int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup)
         }
     }
 
-    if (!in_setup && !h->droppable)
+    if (!in_setup && !h->view->droppable)
         ff_thread_report_progress(&cur->tf, INT_MAX,
-                                  h->picture_structure == PICT_BOTTOM_FIELD);
+                                  h->view->picture_structure == PICT_BOTTOM_FIELD);
     emms_c();
 
-    h->current_slice = 0;
+    h->view->current_slice = 0;
 
     return err;
 }
