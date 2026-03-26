@@ -182,6 +182,16 @@ struct MpegTSContext {
 
     AVStream *epg_stream;
     AVBufferPool* pools[32];
+
+    /** MVC dep PES FIFO -- absorbed dep PES queued for side data delivery */
+    AVBufferRef *mvc_dep_fifo[32];
+    int mvc_dep_fifo_size[32];
+    int mvc_dep_fifo_count;
+    uint8_t *mvc_dep_extra;
+    int mvc_dep_extra_size;
+    int mvc_dep_pid;        ///< dep PID for detection, 0 if not MVC
+    int mvc_dep_deliver;    ///< 1: deliver dep PES (MVC 3D), 0: absorb (default)
+    int mvc_base_st_index;  ///< base H.264 stream index, -1 if unset
 };
 
 #define MPEGTS_OPTIONS \
@@ -205,6 +215,8 @@ static const AVOption options[] = {
      {.i64 = 0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
     {"merge_pmt_versions", "reuse streams when PMT's version/pids change", offsetof(MpegTSContext, merge_pmt_versions), AV_OPT_TYPE_BOOL,
      {.i64 = 0}, 0, 1,  AV_OPT_FLAG_DECODING_PARAM },
+    {"mvc_dep", "deliver MVC dep view PES (for 3D decode)", offsetof(MpegTSContext, mvc_dep_deliver), AV_OPT_TYPE_BOOL,
+     {.i64 = 0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
     {"skip_changes", "skip changing / adding streams / programs", offsetof(MpegTSContext, skip_changes), AV_OPT_TYPE_BOOL,
      {.i64 = 0}, 0, 1, 0 },
     {"skip_clear", "skip clearing programs", offsetof(MpegTSContext, skip_clear), AV_OPT_TYPE_BOOL,
@@ -1161,6 +1173,47 @@ static AVBufferRef *buffer_pool_get(MpegTSContext *ts, int size)
     return av_buffer_pool_get(ts->pools[index]);
 }
 
+/**
+ * Buffer dep PES data for MVC combining instead of delivering.
+ */
+/**
+ * Buffer dep PES data.  For is_start (new PES header), this stores
+ * the PREVIOUS completed PES as a new FIFO entry.  For overflow and
+ * PES_packet_length paths, the data is a partial PES that should be
+ * concatenated with the previous FIFO entry (same PES, split by
+ * max_packet_size).
+ */
+static void mvc_buffer_dep_pes(MpegTSContext *ts, PESContext *pes,
+                               int is_continuation)
+{
+    if (is_continuation && ts->mvc_dep_fifo_count > 0) {
+        /* Append to latest FIFO entry (same PES, overflow split) */
+        int idx = ts->mvc_dep_fifo_count - 1;
+        int old_size = ts->mvc_dep_fifo_size[idx];
+        int new_size = old_size + pes->data_index;
+        AVBufferRef *combined = av_buffer_alloc(new_size + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (combined) {
+            memcpy(combined->data, ts->mvc_dep_fifo[idx]->data, old_size);
+            memcpy(combined->data + old_size, pes->buffer->data, pes->data_index);
+            memset(combined->data + new_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+            av_buffer_unref(&ts->mvc_dep_fifo[idx]);
+            ts->mvc_dep_fifo[idx] = combined;
+            ts->mvc_dep_fifo_size[idx] = new_size;
+        }
+    } else if (ts->mvc_dep_fifo_count < 32) {
+        /* New FIFO entry (completed PES from is_start) */
+        int idx = ts->mvc_dep_fifo_count++;
+        av_buffer_unref(&ts->mvc_dep_fifo[idx]);
+        ts->mvc_dep_fifo[idx]      = pes->buffer;
+        ts->mvc_dep_fifo_size[idx] = pes->data_index;
+        pes->buffer = NULL;
+        reset_pes_packet_state(pes);
+        return;
+    }
+    /* For continuation: don't steal buffer, just reset state */
+    reset_pes_packet_state(pes);
+}
+
 /* return non zero if a packet could be constructed */
 static int mpegts_push_data(MpegTSFilter *filter,
                             const uint8_t *buf, int buf_size, int is_start,
@@ -1176,10 +1229,17 @@ static int mpegts_push_data(MpegTSFilter *filter,
 
     if (is_start) {
         if (pes->state == MPEGTS_PAYLOAD && pes->data_index > 0) {
-            ret = new_pes_packet(pes, ts->pkt);
-            if (ret < 0)
-                return ret;
-            ts->stop_parse = 1;
+            if (ts->mvc_dep_pid && pes->pid == ts->mvc_dep_pid) {
+                av_log(ts->stream, AV_LOG_DEBUG,
+                       "MVC: buffering dep PES pid=0x%x size=%d\n",
+                       pes->pid, pes->data_index);
+                mvc_buffer_dep_pes(ts, pes, 0);
+            } else {
+                ret = new_pes_packet(pes, ts->pkt);
+                if (ret < 0)
+                    return ret;
+                ts->stop_parse = 1;
+            }
         } else {
             reset_pes_packet_state(pes);
         }
@@ -1219,11 +1279,33 @@ static int mpegts_push_data(MpegTSFilter *filter,
                         if (ts->merge_pmt_versions)
                             goto skip; /* wait for PMT to merge new stream */
 
-                        pes->st = avformat_new_stream(ts->stream, NULL);
-                        if (!pes->st)
-                            return AVERROR(ENOMEM);
-                        pes->st->id = pes->pid;
-                        mpegts_set_stream_info(pes->st, pes, 0, 0);
+                        /* MVC dependent view (SSIF): link to base H.264
+                         * stream instead of creating a separate stream.
+                         * In Blu-ray 3D SSIF files, the base and dependent
+                         * view PIDs appear in separate alternating PMTs,
+                         * so the pmt_cb linking code cannot match them.
+                         * Lazy-link here when data arrives. */
+                        if (pes->stream_type == STREAM_TYPE_VIDEO_MVC) {
+                            for (unsigned i = 0; i < ts->stream->nb_streams; i++) {
+                                AVStream *cand = ts->stream->streams[i];
+                                if (cand->codecpar->codec_id == AV_CODEC_ID_H264) {
+                                    pes->st = cand;
+                                    pes->merged_st = 1;
+                                    av_log(ts->stream, AV_LOG_VERBOSE,
+                                           "MVC: linked dependent view PID 0x%x "
+                                           "to H.264 stream\n", pes->pid);
+                                    break;
+                                }
+                            }
+                            if (!pes->st)
+                                goto skip;
+                        } else {
+                            pes->st = avformat_new_stream(ts->stream, NULL);
+                            if (!pes->st)
+                                return AVERROR(ENOMEM);
+                            pes->st->id = pes->pid;
+                            mpegts_set_stream_info(pes->st, pes, 0, 0);
+                        }
                     }
 
                     pes->PES_packet_length = AV_RB16(pes->header + 4);
@@ -1409,12 +1491,26 @@ skip:
 
                 if (pes->data_index > 0 &&
                     pes->data_index + buf_size > max_packet_size) {
-                    ret = new_pes_packet(pes, ts->pkt);
-                    if (ret < 0)
-                        return ret;
-                    pes->PES_packet_length = 0;
-                    max_packet_size = ts->max_packet_size;
-                    ts->stop_parse = 1;
+                    if (ts->mvc_dep_pid &&
+                        pes->pid == ts->mvc_dep_pid) {
+                        /* MVC dep PES overflow: expand buffer to
+                         * accumulate complete PES for FIFO capture. */
+                        int new_max = pes->data_index + buf_size + 204800;
+                        AVBufferRef *newbuf = av_buffer_alloc(new_max + AV_INPUT_BUFFER_PADDING_SIZE);
+                        if (newbuf) {
+                            memcpy(newbuf->data, pes->buffer->data, pes->data_index);
+                            av_buffer_unref(&pes->buffer);
+                            pes->buffer = newbuf;
+                        }
+                        max_packet_size = new_max;
+                    } else {
+                        ret = new_pes_packet(pes, ts->pkt);
+                        if (ret < 0)
+                            return ret;
+                        pes->PES_packet_length = 0;
+                        max_packet_size = ts->max_packet_size;
+                        ts->stop_parse = 1;
+                    }
                 } else if (pes->data_index == 0 &&
                            buf_size > max_packet_size) {
                     // pes packet size is < ts size packet and pes data is padded with STUFFING_BYTE
@@ -1435,11 +1531,15 @@ skip:
                  * a couple of seconds to milliseconds for properly muxed files. */
                 if (!ts->stop_parse && pes->PES_packet_length &&
                     pes->pes_header_size + pes->data_index == pes->PES_packet_length + PES_START_SIZE) {
-                    ts->stop_parse = 1;
-                    ret = new_pes_packet(pes, ts->pkt);
+                    if (ts->mvc_dep_pid && pes->pid == ts->mvc_dep_pid) {
+                        mvc_buffer_dep_pes(ts, pes, 0);
+                    } else {
+                        ts->stop_parse = 1;
+                        ret = new_pes_packet(pes, ts->pkt);
+                        if (ret < 0)
+                            return ret;
+                    }
                     pes->state = MPEGTS_SKIP;
-                    if (ret < 0)
-                        return ret;
                 }
             } while (0);
             buf_size = 0;
@@ -2647,6 +2747,48 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
 
         stream_identifier = parse_stream_identifier_desc(p, p_end) + 1;
 
+        /*
+         * MVC dependent view stream merging (H.264 Annex H, MPEG-TS).
+         *
+         * MVC in MPEG-TS uses two PIDs in the same program:
+         *   - PID A: stream_type=0x1B (H.264 base view) -- standard AVC NALs
+         *   - PID B: stream_type=0x20 (MVC dependent)   -- NAL types 15, 20
+         *
+         * The decoder needs NALs from both PIDs to build reference lists.
+         * Strategy: create a PES filter for the dependent view PID (for
+         * TS packet assembly), but do NOT create a separate AVStream.
+         * After this loop, we link the PES to the base H.264 stream so
+         * both PIDs deliver packets on the same AVStream.
+         *
+         * This means ffprobe shows one video stream (not two), and the
+         * decoder sees interleaved base+dependent NALs naturally.
+         */
+        if (stream_type == STREAM_TYPE_VIDEO_MVC) {
+            if (ts->pids[pid] && ts->pids[pid]->type == MPEGTS_PES) {
+                pes = ts->pids[pid]->u.pes_filter.opaque;
+            } else {
+                if (ts->pids[pid])
+                    mpegts_close_filter(ts, ts->pids[pid]);
+                pes = add_pes_stream(ts, pid, pcr_pid);
+                if (!pes)
+                    goto out;
+            }
+            pes->stream_type = stream_type;
+            ts->mvc_dep_pid = pid;
+            add_pid_to_program(prg, pid);
+            /* Skip the descriptor loop for MVC -- we don't need codec
+             * info since the base stream already has it. */
+            desc_list_len = get16(&p, p_end);
+            if (desc_list_len < 0)
+                goto out;
+            desc_list_len &= 0xfff;
+            desc_list_end  = p + desc_list_len;
+            if (desc_list_end > p_end)
+                goto out;
+            p = desc_list_end;
+            continue;  /* Don't create AVStream -- will be linked below */
+        }
+
         /* now create stream */
         if (ts->pids[pid] && ts->pids[pid]->type == MPEGTS_PES) {
             pes = ts->pids[pid]->u.pes_filter.opaque;
@@ -2740,6 +2882,57 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
             }
         }
         p = desc_list_end;
+    }
+
+    /*
+     * Link MVC dependent view PES to the base H.264 stream.
+     *
+     * Two-pass approach: first find the base H.264 PES (stream_type 0x1B),
+     * then link all MVC PES (stream_type 0x20) to share the base stream's
+     * AVStream pointer.
+     *
+     * merged_st = 1 tells mpegts_close_filter() not to free the PES
+     * context's stream pointer (since it's shared, not owned).
+     *
+     * After this, packets from the dependent view PID are delivered
+     * with st->index pointing to the base H.264 stream. The decoder
+     * sees them as part of the same stream.
+     */
+    if (prg) {
+        PESContext *base_pes = NULL;
+        /* Pass 1: Find the base H.264 stream in this program */
+        for (int j = 0; j < prg->nb_pids; j++) {
+            int p_pid = prg->pids[j];
+            if (p_pid < NB_PID_MAX && ts->pids[p_pid] &&
+                ts->pids[p_pid]->type == MPEGTS_PES) {
+                PESContext *p_pes = ts->pids[p_pid]->u.pes_filter.opaque;
+                if (p_pes->stream_type == STREAM_TYPE_VIDEO_H264 && p_pes->st) {
+                    base_pes = p_pes;
+                    break;
+                }
+            }
+        }
+        /* Pass 2: Link all MVC PES to the base stream */
+        if (base_pes) {
+            ts->mvc_base_st_index = base_pes->st->index;
+            for (int j = 0; j < prg->nb_pids; j++) {
+                int p_pid = prg->pids[j];
+                if (p_pid < NB_PID_MAX && ts->pids[p_pid] &&
+                    ts->pids[p_pid]->type == MPEGTS_PES) {
+                    PESContext *p_pes = ts->pids[p_pid]->u.pes_filter.opaque;
+                    if (p_pes->stream_type == STREAM_TYPE_VIDEO_MVC && !p_pes->st) {
+                        p_pes->st = base_pes->st;
+                        p_pes->merged_st = 1;
+                        if (!ts->mvc_dep_pid)
+                            ts->mvc_dep_pid = p_pes->pid;
+                        av_log(ts->stream, AV_LOG_VERBOSE,
+                               "MVC: merged dependent view PID 0x%x "
+                               "with base H.264 PID 0x%x\n",
+                               p_pes->pid, base_pes->pid);
+                    }
+                }
+            }
+        }
     }
 
     if (!ts->pids[pcr_pid])
@@ -3350,6 +3543,7 @@ static int mpegts_read_header(AVFormatContext *s)
     }
     ts->stream     = s;
     ts->auto_guess = 0;
+    ts->mvc_base_st_index = -1;
 
     if (s->iformat == &ff_mpegts_demuxer.p) {
         /* normal demux */
@@ -3495,6 +3689,19 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
             if (ts->pids[i] && ts->pids[i]->type == MPEGTS_PES) {
                 PESContext *pes = ts->pids[i]->u.pes_filter.opaque;
                 if (pes->state == MPEGTS_PAYLOAD && pes->data_index > 0) {
+                    /* Absorb dep PES at EOF too */
+                    if (ts->mvc_dep_pid &&
+                        pes->pid == ts->mvc_dep_pid) {
+                        /* Only buffer complete dep PES at EOF.
+                         * Partial PES (truncated by stream end)
+                         * would cause decode errors. */
+                        if (pes->PES_packet_length &&
+                            pes->pes_header_size + pes->data_index >=
+                            pes->PES_packet_length + PES_START_SIZE)
+                            mvc_buffer_dep_pes(ts, pes, 0);
+                        pes->state = MPEGTS_SKIP;
+                        continue;
+                    }
                     ret = new_pes_packet(pes, pkt);
                     if (ret < 0)
                         return ret;
@@ -3507,6 +3714,72 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     if (!ret && pkt->size < 0)
         ret = AVERROR_INVALIDDATA;
+
+    /* MVC: attach absorbed dep PES data as side data on base packet.
+     * Flush all available FIFO entries as one blob. */
+    if (!ret && pkt->size > 0 && ts->mvc_dep_fifo_count > 0 &&
+        ts->mvc_base_st_index >= 0 && pkt->stream_index == ts->mvc_base_st_index) {
+        /* One-time: extract dep extradata (SUB_SPS+PPS) from FIFO */
+        if (!ts->mvc_dep_extra) {
+            for (int fi = 0; fi < ts->mvc_dep_fifo_count; fi++) {
+                const uint8_t *d = ts->mvc_dep_fifo[fi]->data;
+                int sz = ts->mvc_dep_fifo_size[fi];
+                for (int k = 0; k + 4 < sz; k++) {
+                    if (d[k]==0 && d[k+1]==0 && d[k+2]==0 && d[k+3]==1 &&
+                        (d[k+4] & 0x1f) == 15) {
+                        int end = sz;
+                        for (int m = k+5; m + 4 < sz; m++)
+                            if (d[m]==0 && d[m+1]==0 && d[m+2]==0 && d[m+3]==1 &&
+                                ((d[m+4]&0x1f)==20 || (d[m+4]&0x1f)==6 ||
+                                 (d[m+4]&0x1f)>=24))
+                                { end = m; break; }
+                        ts->mvc_dep_extra_size = end - k;
+                        ts->mvc_dep_extra = av_malloc(ts->mvc_dep_extra_size);
+                        if (ts->mvc_dep_extra)
+                            memcpy(ts->mvc_dep_extra, d + k, ts->mvc_dep_extra_size);
+                        break;
+                    }
+                }
+                if (ts->mvc_dep_extra) break;
+            }
+            if (!ts->mvc_dep_extra) {
+                ts->mvc_dep_extra = av_malloc(1);
+                ts->mvc_dep_extra_size = 0;
+            }
+        }
+
+        /* Pop one FIFO entry per base packet.  Each dep frame is decoded
+         * after its corresponding base frame, ensuring the inter-view
+         * reference is available in the DPB. */
+        int merged_size = ts->mvc_dep_fifo_size[0];
+        int merge_count = 1;
+
+        int extra = ts->mvc_dep_extra_size;
+        int dep_size = merged_size + extra;
+        uint8_t *sd = av_packet_new_side_data(pkt, AV_PKT_DATA_H264_MVC_DEP,
+                                               dep_size);
+        if (sd) {
+            int off = 0;
+            if (extra) {
+                memcpy(sd, ts->mvc_dep_extra, extra);
+                off = extra;
+            }
+            for (int mi = 0; mi < merge_count; mi++) {
+                memcpy(sd + off, ts->mvc_dep_fifo[mi]->data,
+                       ts->mvc_dep_fifo_size[mi]);
+                off += ts->mvc_dep_fifo_size[mi];
+                av_buffer_unref(&ts->mvc_dep_fifo[mi]);
+            }
+            ts->mvc_dep_fifo_count -= merge_count;
+            memmove(&ts->mvc_dep_fifo[0], &ts->mvc_dep_fifo[merge_count],
+                    ts->mvc_dep_fifo_count * sizeof(ts->mvc_dep_fifo[0]));
+            memmove(&ts->mvc_dep_fifo_size[0], &ts->mvc_dep_fifo_size[merge_count],
+                    ts->mvc_dep_fifo_count * sizeof(ts->mvc_dep_fifo_size[0]));
+            for (int mi = ts->mvc_dep_fifo_count; mi < 32; mi++)
+                ts->mvc_dep_fifo[mi] = NULL;
+        }
+    }
+
     return ret;
 }
 
@@ -3522,6 +3795,11 @@ static void mpegts_free(MpegTSContext *ts)
     for (i = 0; i < NB_PID_MAX; i++)
         if (ts->pids[i])
             mpegts_close_filter(ts, ts->pids[i]);
+
+    for (int j = 0; j < ts->mvc_dep_fifo_count; j++)
+        av_buffer_unref(&ts->mvc_dep_fifo[j]);
+    ts->mvc_dep_fifo_count = 0;
+    av_freep(&ts->mvc_dep_extra);
 }
 
 static int mpegts_read_close(AVFormatContext *s)
