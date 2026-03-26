@@ -28,12 +28,23 @@
 #include "h264.h"
 
 
+typedef struct H264RawNALUnitHeaderMVCExtension {
+    uint8_t  non_idr_flag;
+    uint8_t  priority_id;
+    uint16_t view_id;
+    uint8_t  temporal_id;
+    uint8_t  anchor_pic_flag;
+    uint8_t  inter_view_flag;
+} H264RawNALUnitHeaderMVCExtension;
+
 typedef struct H264RawNALUnitHeader {
     uint8_t nal_ref_idc;
     uint8_t nal_unit_type;
 
     uint8_t svc_extension_flag;
     uint8_t avc_3d_extension_flag;
+
+    H264RawNALUnitHeaderMVCExtension mvc;
 } H264RawNALUnitHeader;
 
 typedef struct H264RawScalingList {
@@ -167,6 +178,54 @@ typedef struct H264RawSPSExtension {
 
     uint8_t additional_extension_flag;
 } H264RawSPSExtension;
+
+typedef struct H264RawSPSMVCApplicableOp {
+    uint8_t  applicable_op_temporal_id;
+    uint16_t applicable_op_num_target_views_minus1;
+    uint16_t applicable_op_target_view_id[H264_MVC_MAX_VIEWS];
+    uint16_t applicable_op_num_views_minus1;
+} H264RawSPSMVCApplicableOp;
+
+typedef struct H264RawSPSMVCLevelValue {
+    uint8_t  level_idc;
+    uint16_t num_applicable_ops_minus1;
+    H264RawSPSMVCApplicableOp applicable_ops[H264_MAX_APPLICABLE_OPS];
+} H264RawSPSMVCLevelValue;
+
+typedef struct H264RawSPSMVCExtension {
+    uint16_t num_views_minus1;
+
+    uint16_t view_id[H264_MVC_MAX_VIEWS];
+
+    uint8_t  num_anchor_refs_l0[H264_MVC_MAX_VIEWS];
+    uint16_t anchor_ref_l0[H264_MVC_MAX_VIEWS][H264_MAX_VIEW_REFS];
+    uint8_t  num_anchor_refs_l1[H264_MVC_MAX_VIEWS];
+    uint16_t anchor_ref_l1[H264_MVC_MAX_VIEWS][H264_MAX_VIEW_REFS];
+
+    uint8_t  num_non_anchor_refs_l0[H264_MVC_MAX_VIEWS];
+    uint16_t non_anchor_ref_l0[H264_MVC_MAX_VIEWS][H264_MAX_VIEW_REFS];
+    uint8_t  num_non_anchor_refs_l1[H264_MVC_MAX_VIEWS];
+    uint16_t non_anchor_ref_l1[H264_MVC_MAX_VIEWS][H264_MAX_VIEW_REFS];
+
+    uint8_t  num_level_values_signalled_minus1;
+    H264RawSPSMVCLevelValue level_values[H264_MAX_LEVEL_VALUES];
+} H264RawSPSMVCExtension;
+
+typedef struct H264RawSubsetSPS {
+    H264RawNALUnitHeader nal_unit_header;
+
+    H264RawSPS sps;
+
+    // MVC extension (profile_idc 118, 128)
+    H264RawSPSMVCExtension mvc;
+    uint8_t mvc_vui_parameters_present_flag;
+
+    uint8_t additional_extension2_flag;
+} H264RawSubsetSPS;
+
+typedef struct H264RawPrefixNALUnit {
+    H264RawNALUnitHeader nal_unit_header;
+} H264RawPrefixNALUnit;
 
 typedef struct H264RawPPS {
     H264RawNALUnitHeader nal_unit_header;
@@ -357,9 +416,10 @@ typedef struct H264RawSliceHeader {
     uint8_t ref_pic_list_modification_flag_l0;
     uint8_t ref_pic_list_modification_flag_l1;
     struct {
-        uint8_t modification_of_pic_nums_idc;
-        int32_t abs_diff_pic_num_minus1;
-        uint8_t long_term_pic_num;
+        uint8_t  modification_of_pic_nums_idc;
+        int32_t  abs_diff_pic_num_minus1;
+        uint8_t  long_term_pic_num;
+        uint16_t abs_diff_view_idx_minus1;
     } rplm_l0[H264_MAX_RPLM_COUNT], rplm_l1[H264_MAX_RPLM_COUNT];
 
     uint8_t luma_log2_weight_denom;
@@ -427,8 +487,9 @@ typedef struct CodedBitstreamH264Context {
 
     // All currently available parameter sets.  These are updated when
     // any parameter set NAL unit is read/written with this context.
-    H264RawSPS *sps[H264_MAX_SPS_COUNT]; ///< RefStruct references
-    H264RawPPS *pps[H264_MAX_PPS_COUNT]; ///< RefStruct references
+    H264RawSPS       *sps[H264_MAX_SPS_COUNT];        ///< RefStruct references
+    H264RawSubsetSPS *subset_sps[H264_MAX_SPS_COUNT]; ///< RefStruct references
+    H264RawPPS       *pps[H264_MAX_PPS_COUNT];        ///< RefStruct references
 
     // The currently active parameter sets.  These are updated when any
     // NAL unit refers to the relevant parameter set.  These pointers
