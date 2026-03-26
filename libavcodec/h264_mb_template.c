@@ -43,7 +43,7 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
     const int mb_x    = sl->mb_x;
     const int mb_y    = sl->mb_y;
     const int mb_xy   = sl->mb_xy;
-    const int mb_type = h->cur_pic.mb_type[mb_xy];
+    const int mb_type = h->view->cur_pic.mb_type[mb_xy];
     uint8_t *dest_y, *dest_cb, *dest_cr;
     int linesize, uvlinesize /*dct_offset*/;
     int i, j;
@@ -53,9 +53,9 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
     const int block_h   = 16 >> h->chroma_y_shift;
     const int chroma422 = CHROMA422(h);
 
-    dest_y  = h->cur_pic.f->data[0] + ((mb_x << PIXEL_SHIFT)     + mb_y * sl->linesize)  * 16;
-    dest_cb = h->cur_pic.f->data[1] +  (mb_x << PIXEL_SHIFT) * 8 + mb_y * sl->uvlinesize * block_h;
-    dest_cr = h->cur_pic.f->data[2] +  (mb_x << PIXEL_SHIFT) * 8 + mb_y * sl->uvlinesize * block_h;
+    dest_y  = h->view->cur_pic.f->data[0] + ((mb_x << PIXEL_SHIFT)     + mb_y * sl->linesize)  * 16;
+    dest_cb = h->view->cur_pic.f->data[1] +  (mb_x << PIXEL_SHIFT) * 8 + mb_y * sl->uvlinesize * block_h;
+    dest_cr = h->view->cur_pic.f->data[2] +  (mb_x << PIXEL_SHIFT) * 8 + mb_y * sl->uvlinesize * block_h;
 
     h->vdsp.prefetch(dest_y  + (sl->mb_x & 3) * 4 * sl->linesize   + (64 << PIXEL_SHIFT), sl->linesize,       4);
     h->vdsp.prefetch(dest_cb + (sl->mb_x & 7)     * sl->uvlinesize + (64 << PIXEL_SHIFT), dest_cr - dest_cb, 2);
@@ -258,7 +258,7 @@ static av_noinline void FUNC(hl_decode_mb_444)(const H264Context *h, H264SliceCo
     const int mb_x    = sl->mb_x;
     const int mb_y    = sl->mb_y;
     const int mb_xy   = sl->mb_xy;
-    const int mb_type = h->cur_pic.mb_type[mb_xy];
+    const int mb_type = h->view->cur_pic.mb_type[mb_xy];
     uint8_t *dest[3];
     int linesize;
     int i, j, p;
@@ -267,7 +267,7 @@ static av_noinline void FUNC(hl_decode_mb_444)(const H264Context *h, H264SliceCo
     const int plane_count      = (SIMPLE || !CONFIG_GRAY || !(h->flags & AV_CODEC_FLAG_GRAY)) ? 3 : 1;
 
     for (p = 0; p < plane_count; p++) {
-        dest[p] = h->cur_pic.f->data[p] +
+        dest[p] = h->view->cur_pic.f->data[p] +
                   ((mb_x << PIXEL_SHIFT) + mb_y * sl->linesize) * 16;
         h->vdsp.prefetch(dest[p] + (sl->mb_x & 3) * 4 * sl->linesize + (64 << PIXEL_SHIFT),
                          sl->linesize, 4);
