@@ -416,18 +416,20 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
             }
             case 4: {
                 /* MVC inter-view ref list modification (idc=4, Annex H).
-                 * Find picture with different view_id, same frame_num. */
+                 * Find base view picture with same frame_num.  Per-view
+                 * DPB means inter-view refs are in views[0]. */
                 int cur_frame_num = h->view->cur_pic_ptr->frame_num;
+                int base_idx = h->view->cur_pic_ptr->base_view_frame;
                 pic_structure = h->view->picture_structure;
-                for (i = h->view->short_ref_count - 1; i >= 0; i--) {
-                    ref = h->view->short_ref[i];
-                    if (ref->view_id != h->cur_view_id &&
-                        ref->frame_num == cur_frame_num &&
-                        (ref->reference & pic_structure))
-                        break;
-                }
-                if (i >= 0)
+                i = -1;
+
+                if (base_idx >= 0 &&
+                    h->views[0].DPB[base_idx].f->buf[0] &&
+                    (h->views[0].DPB[base_idx].reference & pic_structure)) {
+                    ref = &h->views[0].DPB[base_idx];
                     pic_id = ref->pic_id;
+                    i = 0;
+                }
                 break;
             }
             case 5: {

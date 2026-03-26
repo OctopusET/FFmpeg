@@ -577,10 +577,12 @@ static av_cold void h264_decode_flush(AVCodecContext *avctx)
     ff_h264_flush_change(h);
     ff_h264_sei_uninit(&h->sei);
 
-    for (i = 0; i < H264_MAX_PICTURE_COUNT; i++)
-        ff_h264_unref_picture(&h->view->DPB[i]);
-    h->view->cur_pic_ptr = NULL;
-    ff_h264_unref_picture(&h->view->cur_pic);
+    for (int v = 0; v < 2; v++) {
+        for (i = 0; i < H264_MAX_PICTURE_COUNT; i++)
+            ff_h264_unref_picture(&h->views[v].DPB[i]);
+        h->views[v].cur_pic_ptr = NULL;
+        ff_h264_unref_picture(&h->views[v].cur_pic);
+    }
 
     h->mb_y = 0;
     h->non_gray = 0;

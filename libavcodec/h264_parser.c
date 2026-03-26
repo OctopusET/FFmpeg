@@ -398,30 +398,6 @@ static inline int parse_nal_units(AVCodecParserContext *s,
         case H264_NAL_SEI:
             ff_h264_sei_decode(&p->sei, &nal.gb, &p->ps, avctx);
             break;
-        case H264_NAL_EXTEN_SLICE:
-        {
-            /* NAL extension header (H.264 7.3.1, 24 bits):
-             *   svc_extension_flag(1),
-             * then for MVC (svc_extension_flag == 0):
-             *   non_idr_flag(1), priority_id(6), view_id(10),
-             *   temporal_id(3), anchor_pic_flag(1), inter_view_flag(1),
-             *   reserved_one_bit(1) */
-            int non_idr_flag;
-            if (get_bits1(&nal.gb)) // svc_extension_flag
-                break; // SVC not supported
-            non_idr_flag = get_bits1(&nal.gb);
-            skip_bits(&nal.gb, 22);
-
-            idr_pic_flag = !non_idr_flag;
-            if (idr_pic_flag) {
-                s->key_frame = 1;
-                p->poc.prev_frame_num        = 0;
-                p->poc.prev_frame_num_offset = 0;
-                p->poc.prev_poc_msb          =
-                p->poc.prev_poc_lsb          = 0;
-            }
-            goto slice_header;
-        }
         case H264_NAL_IDR_SLICE:
             s->key_frame = 1;
             idr_pic_flag = 1;

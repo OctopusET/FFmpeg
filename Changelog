@@ -35,6 +35,7 @@ version 8.1:
 - ProRes Vulkan encoder
 - LCEVC parser
 - LCEVC enhancement layer exporting in MPEG-TS
+- H.264 MVC (Multiview Video Coding) decoding
 
 
 version 8.0:
