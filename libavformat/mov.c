@@ -2521,6 +2521,65 @@ static int mov_read_glbl(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     return 0;
 }
 
+/**
+ * Read mvcC box and append its SPS/PPS NALUs to the existing extradata.
+ *
+ * MVC (H.264 Multiview) in MP4 stores the base view config in avcC and
+ * the dependent view config (Subset SPS + PPS) in a separate mvcC box.
+ * The mvcC has the same avcC-style layout.  We convert the contained
+ * NALUs to Annex B and append them so the decoder sees both views' PS.
+ */
+static int mov_read_mvcc(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+{
+    AVStream *st;
+    int ret;
+    uint8_t *mvc_data = NULL;
+    int mvc_size;
+    uint8_t *new_extra = NULL;
+    int new_size;
+
+    st = get_curr_st(c);
+    if (!st)
+        return 0;
+
+    if ((uint64_t)atom.size > (1 << 30))
+        return AVERROR_INVALIDDATA;
+
+    /* mvcC only makes sense after avcC has been parsed */
+    if (!st->codecpar->extradata_size || !st->codecpar->extradata)
+        return 0;
+
+    mvc_size = atom.size;
+    mvc_data = av_malloc(mvc_size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!mvc_data)
+        return AVERROR(ENOMEM);
+
+    ret = avio_read(pb, mvc_data, mvc_size);
+    if (ret < mvc_size) {
+        av_free(mvc_data);
+        return ret < 0 ? ret : AVERROR_INVALIDDATA;
+    }
+
+    /* Append mvcC data after existing avcC extradata.  The decoder's
+     * avcC parser will process both: the first avcC-sized block gives
+     * base view SPS+PPS, and the appended mvcC block gives the Subset
+     * SPS + dep view PPS. */
+    new_size = st->codecpar->extradata_size + mvc_size;
+    new_extra = av_realloc(st->codecpar->extradata,
+                           new_size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!new_extra) {
+        av_free(mvc_data);
+        return AVERROR(ENOMEM);
+    }
+    memcpy(new_extra + st->codecpar->extradata_size, mvc_data, mvc_size);
+    memset(new_extra + new_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    st->codecpar->extradata = new_extra;
+    st->codecpar->extradata_size = new_size;
+
+    av_free(mvc_data);
+    return 0;
+}
+
 static int mov_read_dvc1(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 {
     AVStream *st;
@@ -9543,6 +9602,7 @@ static const MOVParseTableEntry mov_default_parse_table[] = {
 { MKTAG('S','M','I',' '), mov_read_svq3 },
 { MKTAG('a','l','a','c'), mov_read_alac }, /* alac specific atom */
 { MKTAG('a','v','c','C'), mov_read_glbl },
+{ MKTAG('m','v','c','C'), mov_read_mvcc },
 { MKTAG('p','a','s','p'), mov_read_pasp },
 { MKTAG('c','l','a','p'), mov_read_clap },
 { MKTAG('s','b','a','s'), mov_read_sbas },
