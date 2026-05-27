@@ -1313,6 +1313,14 @@ static int parse_packet(AVFormatContext *s, AVPacket *pkt,
     if (flush) {
         av_parser_close(sti->parser);
         sti->parser = NULL;
+        /* Discard any side data left on the parser's reused output packet
+         * (out_pkt == sti->parse_pkt) by a frame the parser was still
+         * buffering: its side data was moved onto out_pkt but never emitted
+         * (out_pkt->size stayed 0).  parse_pkt persists across parser
+         * lifetimes, so a later parse_packet() would see a non-empty
+         * out_pkt->side_data and keep the stale entry instead of the new
+         * frame's, stranding H.264 MVC dependent-view side data. */
+        av_packet_unref(out_pkt);
     }
 
 fail:
@@ -1899,6 +1907,10 @@ static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
         if (sti->parser) {
             av_parser_close(sti->parser);
             sti->parser = NULL;
+            /* Drop side data left on the reused parser output packet so the
+             * re-created parser does not re-emit it after the duration probe
+             * seeks back to the start (strands MVC dependent-view side data). */
+            av_packet_unref(sti->parse_pkt);
         }
     }
 
