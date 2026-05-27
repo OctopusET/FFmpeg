@@ -396,6 +396,14 @@ static int decode_extradata_ps(const uint8_t *data, int size, H264ParamSets *ps,
                 goto fail;
             break;
         }
+        case H264_NAL_SUB_SPS:
+            ret = ff_h264_decode_seq_parameter_set(&nal->gb, logctx, ps, 0);
+            if (ret < 0) {
+                av_log(logctx, AV_LOG_WARNING,
+                       "Subset SPS decoding failure in extradata\n");
+                ret = 0;
+            }
+            break;
         case H264_NAL_PPS:
             ret = ff_h264_decode_picture_parameter_set(&nal->gb, logctx, ps,
                                                        nal->size_bits);
@@ -514,6 +522,59 @@ int ff_h264_decode_extradata(const uint8_t *data, int size, H264ParamSets *ps,
         }
         // Store right nal length size that will be used to parse all other nals
         *nal_length_size = (data[4] & 0x03) + 1;
+
+        // Check for appended mvcC data (MVC in MP4: avcC + mvcC concatenated).
+        // Skip the optional avcC High-profile trailer (ISO 14496-15
+        // 5.3.3.1.2: chroma_format, bit depths, SPS extension NALs) first;
+        // its leading byte is 0xFC|chroma_format, so it cannot be confused
+        // with the mvcC configurationVersion byte (1).
+        if (size - (p - data) >= 4 && (p[0] & 0xFC) == 0xFC) {
+            p += 3;
+            cnt = *(p++); // numOfSequenceParameterSetExt
+            for (i = 0; i < cnt; i++) {
+                if (size - (p - data) < 2) {
+                    p = data + size;
+                    break;
+                }
+                nalsize = AV_RB16(p) + 2;
+                if (nalsize > size - (p - data)) {
+                    p = data + size;
+                    break;
+                }
+                p += nalsize; // SPS ext NALs are not needed for decoding
+            }
+        }
+        if (size - (p - data) >= 7 && p[0] == 1) {
+            const uint8_t *mvc = p;
+            int mvc_size = size - (p - data);
+            // Parse SPS from mvcC (may include Subset SPS)
+            cnt = *(mvc + 5) & 0x1f;
+            p   = mvc + 6;
+            for (i = 0; i < cnt; i++) {
+                nalsize = AV_RB16(p) + 2;
+                if (nalsize > mvc_size - (p - mvc))
+                    break;
+                ret = decode_extradata_ps_mp4(p, nalsize, ps, err_recognition, logctx);
+                if (ret < 0)
+                    av_log(logctx, AV_LOG_WARNING,
+                           "Decoding sps %d from mvcC failed\n", i);
+                p += nalsize;
+            }
+            // Parse PPS from mvcC
+            if (p - mvc < mvc_size) {
+                cnt = *(p++);
+                for (i = 0; i < cnt; i++) {
+                    nalsize = AV_RB16(p) + 2;
+                    if (nalsize > mvc_size - (p - mvc))
+                        break;
+                    ret = decode_extradata_ps_mp4(p, nalsize, ps, err_recognition, logctx);
+                    if (ret < 0)
+                        av_log(logctx, AV_LOG_WARNING,
+                               "Decoding pps %d from mvcC failed\n", i);
+                    p += nalsize;
+                }
+            }
+        }
     } else {
         *is_avc = 0;
         ret = decode_extradata_ps(data, size, ps, 0, logctx);
