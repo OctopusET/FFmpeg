@@ -65,8 +65,10 @@ typedef struct H264ParseContext {
     uint8_t parse_history[6];
     int parse_history_count;
     int parse_last_mb;
+    int parse_nal_header_bytes_left;
     int64_t reference_dts;
     int last_frame_num, last_picture_structure;
+    int mvc_in_dep_section;
 } H264ParseContext;
 
 static int find_start_code(const uint8_t *buf, int buf_size,
@@ -123,14 +125,40 @@ static int h264_find_frame_end(H264ParseContext *p, const uint8_t *buf,
                 state >>= 1;           // 2->1, 1->0, 0->0
         } else if (state <= 5) {
             int nalu_type = buf[i] & 0x1F;
+
+            /* MVC combined packets: skip dep-view boundary detection
+             * after a base slice has been found. */
+            if (pc->frame_start_found &&
+                (nalu_type == H264_NAL_SUB_SPS || nalu_type == H264_NAL_PREFIX ||
+                 nalu_type == H264_NAL_EXTEN_SLICE || nalu_type >= 24)) {
+                p->mvc_in_dep_section = 1;
+                state = 7;
+                continue;
+            }
+            if (p->mvc_in_dep_section) {
+                if (nalu_type == H264_NAL_AUD || nalu_type == H264_NAL_SPS ||
+                    nalu_type == H264_NAL_IDR_SLICE || nalu_type == H264_NAL_SLICE)
+                    p->mvc_in_dep_section = 0;
+                else {
+                    state = 7;
+                    continue;
+                }
+            }
+
             if (nalu_type == H264_NAL_SEI || nalu_type == H264_NAL_SPS ||
-                nalu_type == H264_NAL_PPS || nalu_type == H264_NAL_AUD) {
+                nalu_type == H264_NAL_PPS || nalu_type == H264_NAL_AUD ||
+                nalu_type == H264_NAL_SUB_SPS || nalu_type == H264_NAL_PREFIX) {
                 if (pc->frame_start_found) {
                     i++;
                     goto found;
                 }
             } else if (nalu_type == H264_NAL_SLICE || nalu_type == H264_NAL_DPA ||
-                       nalu_type == H264_NAL_IDR_SLICE) {
+                       nalu_type == H264_NAL_IDR_SLICE ||
+                       nalu_type == H264_NAL_EXTEN_SLICE) {
+                if (nalu_type == H264_NAL_EXTEN_SLICE)
+                    p->parse_nal_header_bytes_left = 3;
+                else
+                    p->parse_nal_header_bytes_left = 0;
                 state += 8;
                 continue;
             }
@@ -138,6 +166,10 @@ static int h264_find_frame_end(H264ParseContext *p, const uint8_t *buf,
         } else {
             unsigned int mb, last_mb = p->parse_last_mb;
             GetBitContext gb;
+            if (p->parse_nal_header_bytes_left > 0) {
+                p->parse_nal_header_bytes_left--;
+                continue;
+            }
             p->parse_history[p->parse_history_count++] = buf[i];
 
             init_get_bits(&gb, p->parse_history, 8*p->parse_history_count);
@@ -165,6 +197,7 @@ static int h264_find_frame_end(H264ParseContext *p, const uint8_t *buf,
 found:
     pc->state             = 7;
     pc->frame_start_found = 0;
+    p->mvc_in_dep_section = 0;
     if (p->is_avc)
         return next_avc;
     return i - (state & 5);
@@ -199,7 +232,10 @@ static int scan_mmco_reset(AVCodecParserContext *s, GetBitContext *gb,
 
                     if (reordering_of_pic_nums_idc < 3)
                         get_ue_golomb_long(gb);
-                    else if (reordering_of_pic_nums_idc > 3) {
+                    else if (reordering_of_pic_nums_idc == 4 ||
+                             reordering_of_pic_nums_idc == 5)
+                        get_ue_golomb_long(gb); /* abs_diff_view_idx_minus1 */
+                    else if (reordering_of_pic_nums_idc > 5) {
                         av_log(logctx, AV_LOG_ERROR,
                                "illegal reordering_of_pic_nums_idc %d\n",
                                reordering_of_pic_nums_idc);
@@ -272,6 +308,7 @@ static inline int parse_nal_units(AVCodecParserContext *s,
     int state = -1, got_reset = 0;
     int q264 = buf_size >=4 && !memcmp("Q264", buf, 4);
     int field_poc[2];
+    int idr_pic_flag = 0;
     int ret;
 
     /* set some sane default values */
@@ -326,6 +363,11 @@ static inline int parse_nal_units(AVCodecParserContext *s,
                     src_length = 1000;
             }
             break;
+        case H264_NAL_EXTEN_SLICE:
+            /* MVC extension slice: 3-byte extension header + slice header */
+            if (src_length > 1000)
+                src_length = 1000;
+            break;
         }
         consumed = ff_h2645_extract_rbsp(buf + buf_index, src_length, &rbsp, &nal, 1);
         if (consumed < 0)
@@ -340,6 +382,11 @@ static inline int parse_nal_units(AVCodecParserContext *s,
         nal.ref_idc = get_bits(&nal.gb, 2);
         nal.type    = get_bits(&nal.gb, 5);
 
+        /* MVC: skip dep-view NALs to prevent POC corruption */
+        if (nal.type == H264_NAL_SUB_SPS || nal.type == H264_NAL_PREFIX ||
+            nal.type == H264_NAL_EXTEN_SLICE)
+            continue;
+
         switch (nal.type) {
         case H264_NAL_SPS:
             ff_h264_decode_seq_parameter_set(&nal.gb, avctx, &p->ps, 0);
@@ -353,6 +400,7 @@ static inline int parse_nal_units(AVCodecParserContext *s,
             break;
         case H264_NAL_IDR_SLICE:
             s->key_frame = 1;
+            idr_pic_flag = 1;
 
             p->poc.prev_frame_num        = 0;
             p->poc.prev_frame_num_offset = 0;
@@ -431,7 +479,7 @@ static inline int parse_nal_units(AVCodecParserContext *s,
                 }
             }
 
-            if (nal.type == H264_NAL_IDR_SLICE)
+            if (idr_pic_flag)
                 get_ue_golomb_long(&nal.gb); /* idr_pic_id */
             if (sps->poc_type == 0) {
                 p->poc.poc_lsb = get_bits(&nal.gb, sps->log2_max_poc_lsb);
@@ -462,7 +510,7 @@ static inline int parse_nal_units(AVCodecParserContext *s,
              * FIXME: MMCO_RESET could appear in non-first slice.
              *        Maybe, we should parse all undisposable non-IDR slice of this
              *        picture until encountering MMCO_RESET in a slice of it. */
-            if (nal.ref_idc && nal.type != H264_NAL_IDR_SLICE) {
+            if (nal.ref_idc && !idr_pic_flag) {
                 got_reset = scan_mmco_reset(s, &nal.gb, avctx);
                 if (got_reset < 0)
                     goto fail;
