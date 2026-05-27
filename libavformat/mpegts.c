@@ -64,6 +64,21 @@
 #define PROBE_PACKET_MAX_BUF 8192
 #define PROBE_PACKET_MARGIN 5
 
+/* MVC dependent-view PES reassembly: per-overflow growth and a hard cap so a
+ * malformed dep PID that never terminates cannot grow the buffer without
+ * bound (which would also overflow the int size). */
+#define MVC_DEP_PES_GROW (200 * 1024)
+#define MVC_DEP_PES_MAX  (16 * 1024 * 1024)
+
+/* SSIF interleaves base/dep in large extents, so a whole dep extent (tens of
+ * PES) can be buffered before the matching base extent arrives.  These caps
+ * bound the worst case for a corrupt stream that never delivers the awaited
+ * counterpart: ~512 coded PES per side is far more than any real extent yet
+ * keeps memory bounded (dep byte size is separately capped by MVC_DEP_PES_MAX).
+ */
+#define MVC_DEP_FIFO_MAX   512
+#define MVC_HELD_BASE_MAX  512
+
 enum MpegTSFilterType {
     MPEGTS_PES,
     MPEGTS_SECTION,
@@ -195,6 +210,23 @@ struct MpegTSContext {
 
     AVStream *epg_stream;
     AVBufferPool* pools[32];
+
+    /** MVC dep PES FIFO -- absorbed dep PES queued for side data delivery.
+     *  SSIF (Blu-ray 3D) interleaves base/dep in large chunks (a whole dep
+     *  extent can precede the matching base extent), so this grows on demand,
+     *  capped at MVC_DEP_FIFO_MAX entries. */
+    AVBufferRef **mvc_dep_fifo;
+    int *mvc_dep_fifo_size;
+    int64_t *mvc_dep_fifo_dts;
+    int mvc_dep_fifo_count;
+    int mvc_dep_fifo_alloc;
+    AVPacket **mvc_held_base; ///< base packets awaiting their matching dep PES
+    int mvc_held_base_count;
+    int mvc_held_base_alloc;
+    uint8_t *mvc_dep_extra;
+    int mvc_dep_extra_size;
+    int mvc_dep_pid;        ///< dep PID for detection, 0 if not MVC
+    int mvc_base_st_index;  ///< base H.264 stream index, -1 if unset
 };
 
 #define MPEGTS_OPTIONS \
@@ -1217,6 +1249,54 @@ static AVBufferRef *buffer_pool_get(MpegTSContext *ts, int size)
     return av_buffer_pool_get(ts->pools[index]);
 }
 
+/**
+ * Buffer a completed dependent-view PES as a new FIFO entry (with its DTS,
+ * used later to pair it with the matching base packet).  The PES has already
+ * been fully reassembled in pes->buffer by the time this is called.  If the
+ * FIFO is full the PES is dropped (held-base caps well below this, so it is
+ * not reached for conformant streams).
+ */
+static void mvc_buffer_dep_pes(MpegTSContext *ts, PESContext *pes)
+{
+    int idx;
+
+    if (ts->mvc_dep_fifo_count >= MVC_DEP_FIFO_MAX) {
+        av_log(ts->stream, AV_LOG_WARNING,
+               "MVC dependent-view PES FIFO full, dropping a frame\n");
+        reset_pes_packet_state(pes);
+        return;
+    }
+
+    if (ts->mvc_dep_fifo_count >= ts->mvc_dep_fifo_alloc) {
+        int newalloc = ts->mvc_dep_fifo_alloc ? ts->mvc_dep_fifo_alloc * 2 : 32;
+        AVBufferRef **nb;
+        int *ns;
+        int64_t *nd;
+        if (newalloc > MVC_DEP_FIFO_MAX)
+            newalloc = MVC_DEP_FIFO_MAX;
+        nb = av_realloc_array(ts->mvc_dep_fifo,     newalloc, sizeof(*nb));
+        ns = av_realloc_array(ts->mvc_dep_fifo_size, newalloc, sizeof(*ns));
+        nd = av_realloc_array(ts->mvc_dep_fifo_dts,  newalloc, sizeof(*nd));
+        if (nb) ts->mvc_dep_fifo      = nb;
+        if (ns) ts->mvc_dep_fifo_size = ns;
+        if (nd) ts->mvc_dep_fifo_dts  = nd;
+        if (!nb || !ns || !nd) {
+            av_log(ts->stream, AV_LOG_WARNING,
+                   "MVC dependent-view PES FIFO alloc failed, dropping a frame\n");
+            reset_pes_packet_state(pes);
+            return;
+        }
+        ts->mvc_dep_fifo_alloc = newalloc;
+    }
+
+    idx = ts->mvc_dep_fifo_count++;
+    ts->mvc_dep_fifo[idx]      = pes->buffer;
+    ts->mvc_dep_fifo_size[idx] = pes->data_index;
+    ts->mvc_dep_fifo_dts[idx]  = pes->dts;
+    pes->buffer = NULL;
+    reset_pes_packet_state(pes);
+}
+
 /* return non zero if a packet could be constructed */
 static int mpegts_push_data(MpegTSFilter *filter,
                             const uint8_t *buf, int buf_size, int is_start,
@@ -1232,10 +1312,17 @@ static int mpegts_push_data(MpegTSFilter *filter,
 
     if (is_start) {
         if (pes->state == MPEGTS_PAYLOAD && pes->data_index > 0) {
-            ret = new_pes_packet(pes, ts->pkt);
-            if (ret < 0)
-                return ret;
-            ts->stop_parse = 1;
+            if (ts->mvc_dep_pid && pes->pid == ts->mvc_dep_pid) {
+                av_log(ts->stream, AV_LOG_DEBUG,
+                       "MVC: buffering dep PES pid=0x%x size=%d\n",
+                       pes->pid, pes->data_index);
+                mvc_buffer_dep_pes(ts, pes);
+            } else {
+                ret = new_pes_packet(pes, ts->pkt);
+                if (ret < 0)
+                    return ret;
+                ts->stop_parse = 1;
+            }
         } else {
             reset_pes_packet_state(pes);
         }
@@ -1275,11 +1362,39 @@ static int mpegts_push_data(MpegTSFilter *filter,
                         if (ts->merge_pmt_versions)
                             goto skip; /* wait for PMT to merge new stream */
 
-                        pes->st = avformat_new_stream(ts->stream, NULL);
-                        if (!pes->st)
-                            return AVERROR(ENOMEM);
-                        pes->st->id = pes->pid;
-                        mpegts_set_stream_info(pes->st, pes, 0, 0);
+                        /* MVC dependent view (SSIF): link to base H.264
+                         * stream instead of creating a separate stream.
+                         * In Blu-ray 3D SSIF files, the base and dependent
+                         * view PIDs appear in separate alternating PMTs,
+                         * so the pmt_cb linking code cannot match them.
+                         * Lazy-link here when data arrives. */
+                        if (pes->stream_type == STREAM_TYPE_VIDEO_MVC) {
+                            for (unsigned i = 0; i < ts->stream->nb_streams; i++) {
+                                AVStream *cand = ts->stream->streams[i];
+                                if (cand->codecpar->codec_id == AV_CODEC_ID_H264) {
+                                    pes->st = cand;
+                                    pes->merged_st = 1;
+                                    /* The PMT link pass has not seen base and
+                                     * dep in one program (SSIF alternating
+                                     * PMTs), so set up the pairing here. */
+                                    ts->mvc_base_st_index = cand->index;
+                                    if (!ts->mvc_dep_pid)
+                                        ts->mvc_dep_pid = pes->pid;
+                                    av_log(ts->stream, AV_LOG_VERBOSE,
+                                           "MVC: linked dependent view PID 0x%x "
+                                           "to H.264 stream\n", pes->pid);
+                                    break;
+                                }
+                            }
+                            if (!pes->st)
+                                goto skip;
+                        } else {
+                            pes->st = avformat_new_stream(ts->stream, NULL);
+                            if (!pes->st)
+                                return AVERROR(ENOMEM);
+                            pes->st->id = pes->pid;
+                            mpegts_set_stream_info(pes->st, pes, 0, 0);
+                        }
                     }
 
                     pes->PES_packet_length = AV_RB16(pes->header + 4);
@@ -1465,12 +1580,29 @@ skip:
 
                 if (pes->data_index > 0 &&
                     pes->data_index + buf_size > max_packet_size) {
-                    ret = new_pes_packet(pes, ts->pkt);
-                    if (ret < 0)
-                        return ret;
-                    pes->PES_packet_length = 0;
-                    max_packet_size = ts->max_packet_size;
-                    ts->stop_parse = 1;
+                    if (ts->mvc_dep_pid &&
+                        pes->pid == ts->mvc_dep_pid &&
+                        pes->data_index < MVC_DEP_PES_MAX) {
+                        /* MVC dep PES overflow: expand buffer to accumulate the
+                         * complete PES for FIFO capture.  Bounded by
+                         * MVC_DEP_PES_MAX so a malformed dep PID that never
+                         * terminates cannot grow without limit / overflow int. */
+                        int new_max = pes->data_index + buf_size + MVC_DEP_PES_GROW;
+                        AVBufferRef *newbuf = av_buffer_alloc(new_max + AV_INPUT_BUFFER_PADDING_SIZE);
+                        if (!newbuf)
+                            return AVERROR(ENOMEM);
+                        memcpy(newbuf->data, pes->buffer->data, pes->data_index);
+                        av_buffer_unref(&pes->buffer);
+                        pes->buffer = newbuf;
+                        max_packet_size = new_max;
+                    } else {
+                        ret = new_pes_packet(pes, ts->pkt);
+                        if (ret < 0)
+                            return ret;
+                        pes->PES_packet_length = 0;
+                        max_packet_size = ts->max_packet_size;
+                        ts->stop_parse = 1;
+                    }
                 } else if (pes->data_index == 0 &&
                            buf_size > max_packet_size) {
                     // pes packet size is < ts size packet and pes data is padded with STUFFING_BYTE
@@ -1491,11 +1623,15 @@ skip:
                  * a couple of seconds to milliseconds for properly muxed files. */
                 if (!ts->stop_parse && pes->PES_packet_length &&
                     pes->pes_header_size + pes->data_index == pes->PES_packet_length + PES_START_SIZE) {
-                    ts->stop_parse = 1;
-                    ret = new_pes_packet(pes, ts->pkt);
+                    if (ts->mvc_dep_pid && pes->pid == ts->mvc_dep_pid) {
+                        mvc_buffer_dep_pes(ts, pes);
+                    } else {
+                        ts->stop_parse = 1;
+                        ret = new_pes_packet(pes, ts->pkt);
+                        if (ret < 0)
+                            return ret;
+                    }
                     pes->state = MPEGTS_SKIP;
-                    if (ret < 0)
-                        return ret;
                 }
             } while (0);
             buf_size = 0;
@@ -2543,12 +2679,17 @@ static AVStream *find_matching_stream(MpegTSContext *ts, int pid, unsigned int p
 
     if (stream_identifier) { /* match based on "stream identifier descriptor" if present */
         for (int i = 0; i < p->nb_streams; i++) {
+            int idx = p->streams[i].idx;
+            if (idx < 0 || idx >= s->nb_streams)
+                continue;
             if (p->streams[i].stream_identifier == stream_identifier)
                 if (!found || pmt_stream_idx == i) /* fallback to idx based guess if multiple streams have the same identifier */
-                    found = s->streams[p->streams[i].idx];
+                    found = s->streams[idx];
         }
     } else if (pmt_stream_idx < p->nb_streams) { /* match based on position within the PMT */
-        found = s->streams[p->streams[pmt_stream_idx].idx];
+        int idx = p->streams[pmt_stream_idx].idx;
+        if (idx >= 0 && idx < s->nb_streams)
+            found = s->streams[idx];
     }
 
     if (found) {
@@ -2846,6 +2987,57 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
 
         stream_identifier = parse_stream_identifier_desc(p, p_end) + 1;
 
+        /*
+         * MVC dependent view stream merging (H.264 Annex H, MPEG-TS).
+         *
+         * MVC in MPEG-TS uses two PIDs in the same program:
+         *   - PID A: stream_type=0x1B (H.264 base view) -- standard AVC NALs
+         *   - PID B: stream_type=0x20 (MVC dependent)   -- NAL types 15, 20
+         *
+         * The decoder needs NALs from both PIDs to build reference lists.
+         * Strategy: create a PES filter for the dependent view PID (for
+         * TS packet assembly), but do NOT create a separate AVStream.
+         * After this loop, we link the PES to the base H.264 stream so
+         * both PIDs deliver packets on the same AVStream.
+         *
+         * This means ffprobe shows one video stream (not two), and the
+         * decoder sees interleaved base+dependent NALs naturally.
+         */
+        if (stream_type == STREAM_TYPE_VIDEO_MVC) {
+            if (ts->pids[pid] && ts->pids[pid]->type == MPEGTS_PES) {
+                pes = ts->pids[pid]->u.pes_filter.opaque;
+            } else {
+                if (ts->pids[pid])
+                    mpegts_close_filter(ts, ts->pids[pid]);
+                pes = add_pes_stream(ts, pid, pcr_pid);
+                if (!pes)
+                    goto out;
+            }
+            pes->stream_type = stream_type;
+            ts->mvc_dep_pid = pid;
+            add_pid_to_program(prg, pid);
+            /* Record the PMT entry even though no AVStream is created:
+             * prg->streams[] is indexed by the PMT loop counter, so
+             * skipping the entry would leave an uninitialized hole that
+             * find_matching_stream() and the stream group helpers walk. */
+            if (prg) {
+                prg->streams[i].idx               = -1;
+                prg->streams[i].stream_identifier = stream_identifier;
+                prg->nb_streams++;
+            }
+            /* Skip the descriptor loop for MVC -- we don't need codec
+             * info since the base stream already has it. */
+            desc_list_len = get16(&p, p_end);
+            if (desc_list_len < 0)
+                goto out;
+            desc_list_len &= 0xfff;
+            desc_list_end  = p + desc_list_len;
+            if (desc_list_end > p_end)
+                goto out;
+            p = desc_list_end;
+            continue;  /* Don't create AVStream -- will be linked below */
+        }
+
         /* now create stream */
         if (ts->pids[pid] && ts->pids[pid]->type == MPEGTS_PES) {
             pes = ts->pids[pid]->u.pes_filter.opaque;
@@ -2939,6 +3131,62 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
             }
         }
         p = desc_list_end;
+    }
+
+    /*
+     * Link MVC dependent view PES to the base H.264 stream.
+     *
+     * Two-pass approach: first find the base H.264 PES (stream_type 0x1B),
+     * then link all MVC PES (stream_type 0x20) to share the base stream's
+     * AVStream pointer.
+     *
+     * merged_st = 1 tells mpegts_close_filter() not to free the PES
+     * context's stream pointer (since it's shared, not owned).
+     *
+     * After this, packets from the dependent view PID are delivered
+     * with st->index pointing to the base H.264 stream. The decoder
+     * sees them as part of the same stream.
+     */
+    if (prg) {
+        PESContext *base_pes = NULL;
+        int has_mvc = 0;
+        /* Pass 1: Find the base H.264 stream in this program and check
+         * that the program actually carries an MVC dependent view.
+         * Without the latter check a later-parsed plain 2D H.264 program
+         * on a multi-program TS would retarget mvc_base_st_index. */
+        for (int j = 0; j < prg->nb_pids; j++) {
+            int p_pid = prg->pids[j];
+            if (p_pid < NB_PID_MAX && ts->pids[p_pid] &&
+                ts->pids[p_pid]->type == MPEGTS_PES) {
+                PESContext *p_pes = ts->pids[p_pid]->u.pes_filter.opaque;
+                if (p_pes->stream_type == STREAM_TYPE_VIDEO_H264 && p_pes->st &&
+                    !base_pes)
+                    base_pes = p_pes;
+                else if (p_pes->stream_type == STREAM_TYPE_VIDEO_MVC)
+                    has_mvc = 1;
+            }
+        }
+        /* Pass 2: Link all MVC PES to the base stream */
+        if (base_pes && has_mvc) {
+            ts->mvc_base_st_index = base_pes->st->index;
+            for (int j = 0; j < prg->nb_pids; j++) {
+                int p_pid = prg->pids[j];
+                if (p_pid < NB_PID_MAX && ts->pids[p_pid] &&
+                    ts->pids[p_pid]->type == MPEGTS_PES) {
+                    PESContext *p_pes = ts->pids[p_pid]->u.pes_filter.opaque;
+                    if (p_pes->stream_type == STREAM_TYPE_VIDEO_MVC && !p_pes->st) {
+                        p_pes->st = base_pes->st;
+                        p_pes->merged_st = 1;
+                        if (!ts->mvc_dep_pid)
+                            ts->mvc_dep_pid = p_pes->pid;
+                        av_log(ts->stream, AV_LOG_VERBOSE,
+                               "MVC: merged dependent view PID 0x%x "
+                               "with base H.264 PID 0x%x\n",
+                               p_pes->pid, base_pes->pid);
+                    }
+                }
+            }
+        }
     }
 
     if (!ts->pids[pcr_pid])
@@ -3556,6 +3804,7 @@ static int mpegts_read_header(AVFormatContext *s)
     }
     ts->stream     = s;
     ts->auto_guess = 0;
+    ts->mvc_base_st_index = -1;
 
     if (s->iformat == &ff_mpegts_demuxer.p) {
         /* normal demux */
@@ -3686,7 +3935,163 @@ static int mpegts_raw_read_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 }
 
-static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
+/* Pop the leading dep FIFO entry, compacting all three parallel arrays. */
+/*
+ * Drop all buffered MVC dependent-view PES and held base packets.
+ *
+ * The dep PES FIFO and the held-base queue carry decode-order pairing state
+ * that is only valid for a contiguous read.  A seek -- including the reads
+ * mpegts_get_dts() performs during the duration probe and binary-search
+ * seeking, which jump around the file and then return -- would otherwise
+ * leave dep PES from one file position to be paired with base packets from
+ * another, silently attaching the wrong dependent view.  Clear the per-read
+ * pairing state; the stream-wide config (mvc_dep_pid, mvc_base_st_index,
+ * mvc_dep_extra) is kept.
+ */
+static void mvc_flush_state(MpegTSContext *ts)
+{
+    for (int i = 0; i < ts->mvc_dep_fifo_count; i++)
+        av_buffer_unref(&ts->mvc_dep_fifo[i]);
+    ts->mvc_dep_fifo_count = 0;
+    for (int i = 0; i < ts->mvc_held_base_count; i++)
+        av_packet_free(&ts->mvc_held_base[i]);
+    ts->mvc_held_base_count = 0;
+}
+
+/* Remove dep FIFO entry @idx (its buffer is assumed already consumed/unref'd by
+ * the caller) and shift the tail down to keep the FIFO contiguous. */
+static void mvc_dep_fifo_remove(MpegTSContext *ts, int idx)
+{
+    ts->mvc_dep_fifo_count--;
+    memmove(&ts->mvc_dep_fifo[idx], &ts->mvc_dep_fifo[idx + 1],
+            (ts->mvc_dep_fifo_count - idx) * sizeof(ts->mvc_dep_fifo[0]));
+    memmove(&ts->mvc_dep_fifo_size[idx], &ts->mvc_dep_fifo_size[idx + 1],
+            (ts->mvc_dep_fifo_count - idx) * sizeof(ts->mvc_dep_fifo_size[0]));
+    memmove(&ts->mvc_dep_fifo_dts[idx], &ts->mvc_dep_fifo_dts[idx + 1],
+            (ts->mvc_dep_fifo_count - idx) * sizeof(ts->mvc_dep_fifo_dts[0]));
+    ts->mvc_dep_fifo[ts->mvc_dep_fifo_count] = NULL;
+}
+
+/*
+ * Attach the dependent-view PES that belongs to base packet @pkt as
+ * AV_PKT_DATA_H264_MVC_DEP side data.  Base and dep PES of the same access
+ * unit carry identical DTS; the DTS ladder is monotonic in arrival order
+ * (unlike PTS, which jumps around due to B-frame reorder), so DTS is the
+ * reliable pairing key.
+ *
+ * Returns:
+ *   1  side data attached (or DTS unavailable -> legacy pop-oldest fallback,
+ *      keeping non-MVC / dts-less streams unaffected), or nothing to attach.
+ *   0  the matching dep has not been buffered yet (its dep PES arrives on a
+ *      later TS read, e.g. base B-frame PES precedes its dep PES): the caller
+ *      must HOLD this base packet and retry after reading more TS data.
+ */
+static int mvc_attach_dep(MpegTSContext *ts, AVPacket *pkt)
+{
+    int extra, dep_size, off;
+    uint8_t *sd;
+
+    if (ts->mvc_base_st_index < 0 ||
+        pkt->stream_index != ts->mvc_base_st_index)
+        return 1;
+
+    /* No dep buffered yet.  If the base has a valid DTS, hold it: the dep PES
+     * of this access unit may still arrive (base B-frame PES can precede its
+     * dep PES).  Without a DTS we cannot pair, so emit immediately. */
+    if (ts->mvc_dep_fifo_count == 0)
+        return pkt->dts == AV_NOPTS_VALUE;
+
+    /* One-time: extract dep extradata (SUB_SPS+PPS) from FIFO */
+    if (!ts->mvc_dep_extra) {
+        for (int fi = 0; fi < ts->mvc_dep_fifo_count; fi++) {
+            const uint8_t *d = ts->mvc_dep_fifo[fi]->data;
+            int sz = ts->mvc_dep_fifo_size[fi];
+            for (int k = 0; k + 4 < sz; k++) {
+                if (d[k]==0 && d[k+1]==0 && d[k+2]==0 && d[k+3]==1 &&
+                    (d[k+4] & 0x1f) == 15) {
+                    int end = sz;
+                    for (int m = k+5; m + 4 < sz; m++)
+                        if (d[m]==0 && d[m+1]==0 && d[m+2]==0 && d[m+3]==1 &&
+                            ((d[m+4]&0x1f)==20 || (d[m+4]&0x1f)==6 ||
+                             (d[m+4]&0x1f)>=24))
+                            { end = m; break; }
+                    ts->mvc_dep_extra_size = end - k;
+                    ts->mvc_dep_extra = av_malloc(ts->mvc_dep_extra_size);
+                    if (ts->mvc_dep_extra)
+                        memcpy(ts->mvc_dep_extra, d + k, ts->mvc_dep_extra_size);
+                    break;
+                }
+            }
+            if (ts->mvc_dep_extra) break;
+        }
+        if (!ts->mvc_dep_extra) {
+            ts->mvc_dep_extra = av_malloc(1);
+            ts->mvc_dep_extra_size = 0;
+        }
+    }
+
+    {
+        int idx = 0;  /* dep FIFO entry to attach; default head */
+
+        if (pkt->dts != AV_NOPTS_VALUE) {
+            /* SSIF interleaves base and dep in large, mutually offset extents,
+             * so the matching dep is NOT necessarily at the FIFO head and may
+             * have a higher arrival position than later deps.  Search the whole
+             * buffered FIFO for the dep whose DTS equals this base's DTS. */
+            int found = -1;
+            int64_t min_dts = INT64_MAX;
+            for (int fi = 0; fi < ts->mvc_dep_fifo_count; fi++) {
+                int64_t d = ts->mvc_dep_fifo_dts[fi];
+                if (d == AV_NOPTS_VALUE)
+                    continue;
+                if (d == pkt->dts) { found = fi; break; }
+                if (d < min_dts)   min_dts = d;
+            }
+
+            if (found < 0) {
+                /* No DTS match buffered.  If every buffered dep has a DTS
+                 * strictly greater than this base, the matching dep simply has
+                 * not arrived yet -> hold the base and retry after more reads.
+                 * Otherwise (a buffered dep is <= this base's DTS but unmatched)
+                 * this base genuinely has no dep, e.g. its dep was lost or it is
+                 * a base-only access unit; emit it without dep. */
+                if (min_dts != INT64_MAX && min_dts > pkt->dts)
+                    return 0;
+                /* Fall back to attaching a NOPTS head dep if present (deps that
+                 * carry no DTS pair by arrival order), else emit base-only. */
+                if (ts->mvc_dep_fifo_dts[0] != AV_NOPTS_VALUE)
+                    return 1;
+                idx = 0;
+            } else {
+                idx = found;
+            }
+        }
+
+        /* Attach dep FIFO entry @idx to this base packet. */
+        extra    = ts->mvc_dep_extra_size;
+        dep_size = ts->mvc_dep_fifo_size[idx] + extra;
+        sd = av_packet_new_side_data(pkt, AV_PKT_DATA_H264_MVC_DEP, dep_size);
+        if (sd) {
+            off = 0;
+            if (extra) {
+                memcpy(sd, ts->mvc_dep_extra, extra);
+                off = extra;
+            }
+            memcpy(sd + off, ts->mvc_dep_fifo[idx]->data,
+                   ts->mvc_dep_fifo_size[idx]);
+        } else {
+            av_log(ts->stream, AV_LOG_ERROR,
+                   "MVC: dependent view data lost (out of memory)\n");
+        }
+        /* Remove the entry even if allocation failed: a stale entry can
+         * never DTS-match a later base packet and would clog the FIFO. */
+        av_buffer_unref(&ts->mvc_dep_fifo[idx]);
+        mvc_dep_fifo_remove(ts, idx);
+    }
+    return 1;
+}
+
+static int mpegts_read_one(AVFormatContext *s, AVPacket *pkt)
 {
     MpegTSContext *ts = s->priv_data;
     int ret, i;
@@ -3701,6 +4106,19 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
             if (ts->pids[i] && ts->pids[i]->type == MPEGTS_PES) {
                 PESContext *pes = ts->pids[i]->u.pes_filter.opaque;
                 if (pes->state == MPEGTS_PAYLOAD && pes->data_index > 0) {
+                    /* Absorb dep PES at EOF too */
+                    if (ts->mvc_dep_pid &&
+                        pes->pid == ts->mvc_dep_pid) {
+                        /* Only buffer complete dep PES at EOF.
+                         * Partial PES (truncated by stream end)
+                         * would cause decode errors. */
+                        if (pes->PES_packet_length &&
+                            pes->pes_header_size + pes->data_index >=
+                            pes->PES_packet_length + PES_START_SIZE)
+                            mvc_buffer_dep_pes(ts, pes);
+                        pes->state = MPEGTS_SKIP;
+                        continue;
+                    }
                     ret = new_pes_packet(pes, pkt);
                     if (ret < 0)
                         return ret;
@@ -3713,7 +4131,125 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     if (!ret && pkt->size < 0)
         ret = AVERROR_INVALIDDATA;
+
     return ret;
+}
+
+/* Drop the head of the held-base queue and shift the rest down. */
+static void mvc_held_base_shift(MpegTSContext *ts)
+{
+    av_packet_free(&ts->mvc_held_base[0]);
+    ts->mvc_held_base_count--;
+    for (int i = 0; i < ts->mvc_held_base_count; i++)
+        ts->mvc_held_base[i] = ts->mvc_held_base[i + 1];
+    ts->mvc_held_base[ts->mvc_held_base_count] = NULL;
+}
+
+/*
+ * Try to emit the head of the held-base queue into @pkt.  The head is the
+ * oldest base packet awaiting its dep PES; emit it strictly in queue order.
+ *   - A NOPTS base (field/redundant pic, no dep) is emitted as soon as it
+ *     reaches the head.
+ *   - A DTS-carrying base is emitted once its matching dep PES has been
+ *     buffered (mvc_attach_dep returns 1: dep attached, or no dep for it),
+ *     or unconditionally at EOF (@drain).
+ * Returns 1 if a packet was emitted into @pkt, 0 if the head must keep
+ * waiting for its dep PES to arrive.
+ */
+static int mvc_emit_held_base(MpegTSContext *ts, AVPacket *pkt, int drain)
+{
+    AVPacket *head;
+
+    if (ts->mvc_held_base_count == 0)
+        return 0;
+    head = ts->mvc_held_base[0];
+
+    if (head->dts != AV_NOPTS_VALUE) {
+        if (!drain && !mvc_attach_dep(ts, head))
+            return 0;            /* matching dep not buffered yet */
+        if (drain)
+            mvc_attach_dep(ts, head);  /* attach whatever exists, or none */
+    }
+
+    av_packet_move_ref(pkt, head);
+    mvc_held_base_shift(ts);
+    return 1;
+}
+
+static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
+{
+    MpegTSContext *ts = s->priv_data;
+    int ret;
+
+    /* MVC: a base packet whose matching dep PES has not arrived yet is queued
+     * in mvc_held_base so the dep can be attached to the CORRECT base.  In
+     * this stream a base B-frame PES (and the NOPTS field/redundant base PES
+     * that may follow it) precede the dep PES of the same access unit, so the
+     * base packets are held in arrival order until their dep is buffered, then
+     * emitted head-first.  Non-base packets pass through unchanged. */
+    for (;;) {
+        /* Emit a ready held base before reading more. */
+        if (mvc_emit_held_base(ts, pkt, 0))
+            return 0;
+
+        ret = mpegts_read_one(s, pkt);
+
+        /* EOF/error: flush the held-base queue (matching dep never arrived). */
+        if (ret < 0) {
+            if (mvc_emit_held_base(ts, pkt, 1))
+                return 0;
+            return ret;
+        }
+
+        /* Engage the MVC hold path only once the dep substream is known
+         * (mvc_dep_pid); plain 2D / non-MVC streams pass through. */
+        if (pkt->size > 0 && ts->mvc_dep_pid && ts->mvc_base_st_index >= 0 &&
+            pkt->stream_index == ts->mvc_base_st_index) {
+            /* If queue is empty and the dep is already buffered, attach and
+             * emit immediately (the common I/P-frame fast path). */
+            if (ts->mvc_held_base_count == 0 && mvc_attach_dep(ts, pkt))
+                return ret;
+            /* Otherwise queue this base in arrival order and keep reading
+             * until its dep PES is buffered.  Overflow guard: if the queue is
+             * at the hard cap (a corrupt stream that never buffers the awaited
+             * dep), force out the OLDEST held base in order -- attaching
+             * whatever dep exists -- to make room, then queue the current base.
+             * This preserves arrival order instead of emitting the newest
+             * first. */
+            if (ts->mvc_held_base_count >= MVC_HELD_BASE_MAX) {
+                AVPacket *newbase = av_packet_alloc();
+                if (!newbase)
+                    return AVERROR(ENOMEM);
+                av_packet_move_ref(newbase, pkt);
+                mvc_attach_dep(ts, ts->mvc_held_base[0]);
+                av_packet_move_ref(pkt, ts->mvc_held_base[0]);
+                mvc_held_base_shift(ts);
+                ts->mvc_held_base[ts->mvc_held_base_count++] = newbase;
+                return ret;
+            }
+            if (ts->mvc_held_base_count >= ts->mvc_held_base_alloc) {
+                int newalloc = ts->mvc_held_base_alloc ? ts->mvc_held_base_alloc * 2 : 8;
+                AVPacket **nb;
+                if (newalloc > MVC_HELD_BASE_MAX)
+                    newalloc = MVC_HELD_BASE_MAX;
+                nb = av_realloc_array(ts->mvc_held_base, newalloc, sizeof(*nb));
+                if (!nb)
+                    return AVERROR(ENOMEM);
+                ts->mvc_held_base       = nb;
+                ts->mvc_held_base_alloc = newalloc;
+            }
+            ts->mvc_held_base[ts->mvc_held_base_count] = av_packet_alloc();
+            if (!ts->mvc_held_base[ts->mvc_held_base_count])
+                return AVERROR(ENOMEM);
+            av_packet_move_ref(ts->mvc_held_base[ts->mvc_held_base_count], pkt);
+            ts->mvc_held_base_count++;
+            continue;
+        }
+
+        /* Non-base packet: pass through immediately (held bases, if any, are
+         * reordered relative to it downstream by DTS). */
+        return ret;
+    }
 }
 
 static void mpegts_free(MpegTSContext *ts)
@@ -3728,6 +4264,20 @@ static void mpegts_free(MpegTSContext *ts)
     for (i = 0; i < NB_PID_MAX; i++)
         if (ts->pids[i])
             mpegts_close_filter(ts, ts->pids[i]);
+
+    for (int j = 0; j < ts->mvc_dep_fifo_count; j++)
+        av_buffer_unref(&ts->mvc_dep_fifo[j]);
+    ts->mvc_dep_fifo_count = 0;
+    ts->mvc_dep_fifo_alloc = 0;
+    av_freep(&ts->mvc_dep_fifo);
+    av_freep(&ts->mvc_dep_fifo_size);
+    av_freep(&ts->mvc_dep_fifo_dts);
+    av_freep(&ts->mvc_dep_extra);
+    for (int j = 0; j < ts->mvc_held_base_count; j++)
+        av_packet_free(&ts->mvc_held_base[j]);
+    ts->mvc_held_base_count = 0;
+    ts->mvc_held_base_alloc = 0;
+    av_freep(&ts->mvc_held_base);
 }
 
 static int mpegts_read_close(AVFormatContext *s)
@@ -3777,9 +4327,11 @@ static int64_t mpegts_get_dts(AVFormatContext *s, int stream_index,
     MpegTSContext *ts = s->priv_data;
     AVPacket *pkt;
     int64_t pos;
+    int64_t dts = AV_NOPTS_VALUE;
     int pos47 = ts->pos47_full % ts->raw_packet_size;
     pos = ((*ppos  + ts->raw_packet_size - 1 - pos47) / ts->raw_packet_size) * ts->raw_packet_size + pos47;
     ff_read_frame_flush(s);
+    mvc_flush_state(ts);
     if (avio_seek(s->pb, pos, SEEK_SET) < 0)
         return AV_NOPTS_VALUE;
     pkt = av_packet_alloc();
@@ -3787,18 +4339,15 @@ static int64_t mpegts_get_dts(AVFormatContext *s, int stream_index,
         return AV_NOPTS_VALUE;
     while(pos < pos_limit) {
         int ret = av_read_frame(s, pkt);
-        if (ret < 0) {
-            av_packet_free(&pkt);
-            return AV_NOPTS_VALUE;
-        }
+        if (ret < 0)
+            break;
         if (pkt->dts != AV_NOPTS_VALUE && pkt->pos >= 0) {
             ff_reduce_index(s, pkt->stream_index);
             av_add_index_entry(s->streams[pkt->stream_index], pkt->pos, pkt->dts, 0, 0, AVINDEX_KEYFRAME /* FIXME keyframe? */);
             if (pkt->stream_index == stream_index && pkt->pos >= *ppos) {
-                int64_t dts = pkt->dts;
+                dts   = pkt->dts;
                 *ppos = pkt->pos;
-                av_packet_free(&pkt);
-                return dts;
+                break;
             }
         }
         pos = pkt->pos;
@@ -3806,7 +4355,11 @@ static int64_t mpegts_get_dts(AVFormatContext *s, int stream_index,
     }
 
     av_packet_free(&pkt);
-    return AV_NOPTS_VALUE;
+    /* MVC packets held/buffered by the hold-attach machinery during this
+     * probe belong to the probe position, not to wherever the caller
+     * seeks next; drop them so they are not emitted after the seek. */
+    mvc_flush_state(ts);
+    return dts;
 }
 
 /**************************************************************/
