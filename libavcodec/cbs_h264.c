@@ -378,6 +378,20 @@ static int cbs_h264_replace_ ## ps_var(CodedBitstreamContext *ctx, \
 cbs_h2645_replace_ps(SPS, sps, seq_parameter_set_id)
 cbs_h2645_replace_ps(PPS, pps, pic_parameter_set_id)
 
+static int cbs_h264_replace_subset_sps(CodedBitstreamContext *ctx,
+                                       CodedBitstreamUnit *unit)
+{
+    CodedBitstreamH264Context *priv = ctx->priv_data;
+    H264RawSubsetSPS *subset_sps = unit->content;
+    unsigned int id = subset_sps->sps.seq_parameter_set_id;
+    int err = ff_cbs_make_unit_refcounted(ctx, unit);
+    if (err < 0)
+        return err;
+    av_assert0(unit->content_ref);
+    av_refstruct_replace(&priv->subset_sps[id], unit->content_ref);
+    return 0;
+}
+
 static int cbs_h264_read_nal_unit(CodedBitstreamContext *ctx,
                                   CodedBitstreamUnit *unit)
 {
@@ -415,6 +429,20 @@ static int cbs_h264_read_nal_unit(CodedBitstreamContext *ctx,
         }
         break;
 
+    case H264_NAL_SUB_SPS:
+        {
+            H264RawSubsetSPS *subset_sps = unit->content;
+
+            err = cbs_h264_read_subset_sps(ctx, &gbc, subset_sps);
+            if (err < 0)
+                return err;
+
+            err = cbs_h264_replace_subset_sps(ctx, unit);
+            if (err < 0)
+                return err;
+        }
+        break;
+
     case H264_NAL_PPS:
         {
             H264RawPPS *pps = unit->content;
@@ -432,6 +460,7 @@ static int cbs_h264_read_nal_unit(CodedBitstreamContext *ctx,
     case H264_NAL_SLICE:
     case H264_NAL_IDR_SLICE:
     case H264_NAL_AUXILIARY_SLICE:
+    case H264_NAL_EXTEN_SLICE:
         {
             H264RawSlice *slice = unit->content;
             int pos, len;
@@ -452,6 +481,14 @@ static int cbs_h264_read_nal_unit(CodedBitstreamContext *ctx,
                 return AVERROR(ENOMEM);
             slice->data = unit->data + pos / 8;
             slice->data_bit_start = pos % 8;
+        }
+        break;
+
+    case H264_NAL_PREFIX:
+        {
+            err = cbs_h264_read_prefix_nal_unit(ctx, &gbc, unit->content);
+            if (err < 0)
+                return err;
         }
         break;
 
@@ -528,6 +565,20 @@ static int cbs_h264_write_nal_unit(CodedBitstreamContext *ctx,
         }
         break;
 
+    case H264_NAL_SUB_SPS:
+        {
+            H264RawSubsetSPS *subset_sps = unit->content;
+
+            err = cbs_h264_write_subset_sps(ctx, pbc, subset_sps);
+            if (err < 0)
+                return err;
+
+            err = cbs_h264_replace_subset_sps(ctx, unit);
+            if (err < 0)
+                return err;
+        }
+        break;
+
     case H264_NAL_PPS:
         {
             H264RawPPS *pps = unit->content;
@@ -545,6 +596,7 @@ static int cbs_h264_write_nal_unit(CodedBitstreamContext *ctx,
     case H264_NAL_SLICE:
     case H264_NAL_IDR_SLICE:
     case H264_NAL_AUXILIARY_SLICE:
+    case H264_NAL_EXTEN_SLICE:
         {
             H264RawSlice *slice = unit->content;
 
@@ -589,6 +641,14 @@ static int cbs_h264_write_nal_unit(CodedBitstreamContext *ctx,
         }
         break;
 
+    case H264_NAL_PREFIX:
+        {
+            err = cbs_h264_write_prefix_nal_unit(ctx, pbc, unit->content);
+            if (err < 0)
+                return err;
+        }
+        break;
+
     case H264_NAL_END_SEQUENCE:
         {
             err = cbs_h264_write_end_of_sequence(ctx, pbc, unit->content);
@@ -628,13 +688,17 @@ static int cbs_h264_discarded_nal_unit(CodedBitstreamContext *ctx,
     // keep non-VCL
     if (unit->type != H264_NAL_SLICE &&
         unit->type != H264_NAL_IDR_SLICE &&
-        unit->type != H264_NAL_AUXILIARY_SLICE)
+        unit->type != H264_NAL_AUXILIARY_SLICE &&
+        unit->type != H264_NAL_EXTEN_SLICE)
         return 0;
 
     if (skip >= AVDISCARD_ALL)
         return 1;
 
-    if (skip >= AVDISCARD_NONKEY && unit->type != H264_NAL_IDR_SLICE)
+    /* Pure type check first: does not need decomposed content.  MVC
+     * extension slices need the non_idr_flag from the header below. */
+    if (skip >= AVDISCARD_NONKEY && unit->type != H264_NAL_IDR_SLICE &&
+        unit->type != H264_NAL_EXTEN_SLICE)
         return 1;
 
     header = (H264RawNALUnitHeader *)unit->content;
@@ -643,6 +707,10 @@ static int cbs_h264_discarded_nal_unit(CodedBitstreamContext *ctx,
                 "h264 nal unit header is null, missing decompose?\n");
         return 0;
     }
+
+    if (skip >= AVDISCARD_NONKEY && unit->type == H264_NAL_EXTEN_SLICE &&
+        header->mvc.non_idr_flag)
+        return 1;
 
     if (skip >= AVDISCARD_NONREF && !header->nal_ref_idc)
         return 1;
@@ -672,6 +740,8 @@ static av_cold void cbs_h264_flush(CodedBitstreamContext *ctx)
 
     for (int i = 0; i < FF_ARRAY_ELEMS(h264->sps); i++)
         av_refstruct_unref(&h264->sps[i]);
+    for (int i = 0; i < FF_ARRAY_ELEMS(h264->subset_sps); i++)
+        av_refstruct_unref(&h264->subset_sps[i]);
     for (int i = 0; i < FF_ARRAY_ELEMS(h264->pps); i++)
         av_refstruct_unref(&h264->pps[i]);
 
@@ -689,6 +759,8 @@ static av_cold void cbs_h264_close(CodedBitstreamContext *ctx)
 
     for (i = 0; i < FF_ARRAY_ELEMS(h264->sps); i++)
         av_refstruct_unref(&h264->sps[i]);
+    for (i = 0; i < FF_ARRAY_ELEMS(h264->subset_sps); i++)
+        av_refstruct_unref(&h264->subset_sps[i]);
     for (i = 0; i < FF_ARRAY_ELEMS(h264->pps); i++)
         av_refstruct_unref(&h264->pps[i]);
 }
@@ -702,12 +774,16 @@ static void cbs_h264_free_sei(AVRefStructOpaque unused, void *content)
 static CodedBitstreamUnitTypeDescriptor cbs_h264_unit_types[] = {
     CBS_UNIT_TYPE_POD(H264_NAL_SPS,     H264RawSPS),
     CBS_UNIT_TYPE_POD(H264_NAL_SPS_EXT, H264RawSPSExtension),
+    CBS_UNIT_TYPE_POD(H264_NAL_SUB_SPS, H264RawSubsetSPS),
 
     CBS_UNIT_TYPE_INTERNAL_REF(H264_NAL_PPS, H264RawPPS, slice_group_id),
 
     CBS_UNIT_TYPES_INTERNAL_REF((H264_NAL_IDR_SLICE,
                                  H264_NAL_SLICE,
                                  H264_NAL_AUXILIARY_SLICE), H264RawSlice, data),
+    CBS_UNIT_TYPE_INTERNAL_REF(H264_NAL_EXTEN_SLICE, H264RawSlice, data),
+
+    CBS_UNIT_TYPE_POD(H264_NAL_PREFIX,       H264RawPrefixNALUnit),
 
     CBS_UNIT_TYPE_POD(H264_NAL_AUD,          H264RawAUD),
     CBS_UNIT_TYPE_POD(H264_NAL_FILLER_DATA,  H264RawFiller),
