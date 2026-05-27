@@ -38,6 +38,42 @@ Select an operating point of a scalable AV1 bitstream (0 - 31). Default is 0.
 
 @end table
 
+@section h264
+H.264 (AKA ITU-T H.264, MPEG-4 Part 10, AVC) decoder.
+
+The decoder supports H.264 MVC (Multiview Video Coding) stereo streams with two
+views, as used in Blu-ray 3D discs. Views to be output are selected by
+supplying a list of view IDs to the decoder (the @option{view_ids} option).
+
+Only the base layer is decoded by default.
+
+Note that decoding the dependent view requires single-threaded or
+slice-threaded operation (e.g. @code{-threads 1} or
+@code{-thread_type slice}). Under frame threading only the base view is
+decoded and a warning is printed.
+
+@subsection Options
+
+@table @option
+
+@item view_ids (MVC)
+Specify a list of view IDs that should be output. This option can also be set to
+a single '-1', which will cause all views to be decoded and output.
+
+@item view_ids_available (MVC)
+This option may be read by the caller to retrieve an array of view IDs available
+in the stream. The array is empty for single-view video.
+
+@item view_pos_available (MVC)
+This option may be read by the caller to retrieve an array of view positions
+(left, right, or unspecified) available in the stream, as
+@code{AVStereo3DView} values. When the array is available, its elements apply to
+the corresponding elements of @option{view_ids_available}, i.e.
+@code{view_pos_available[i]} contains the position of view with ID
+@code{view_ids_available[i]}.
+
+@end table
+
 @section hevc
 HEVC (AKA ITU-T H.265 or ISO/IEC 23008-2) decoder.
 

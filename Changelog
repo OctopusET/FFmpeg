@@ -8,6 +8,7 @@ version <next>:
 - LCEVC payload merging bitstream filter
 - MVR demuxer
 - latticepal filter
+- H.264 MVC (Multiview Video Coding) decoding
 
 
 version 9.0:
