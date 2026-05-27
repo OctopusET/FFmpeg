@@ -27,6 +27,23 @@ static int FUNC(rbsp_trailing_bits)(CodedBitstreamContext *ctx, RWContext *rw)
     return 0;
 }
 
+static int FUNC(nal_unit_header_mvc_extension)(CodedBitstreamContext *ctx,
+                                                RWContext *rw,
+                                                H264RawNALUnitHeaderMVCExtension *current)
+{
+    int err;
+
+    flag(non_idr_flag);
+    ub(6, priority_id);
+    ub(10, view_id);
+    ub(3, temporal_id);
+    flag(anchor_pic_flag);
+    flag(inter_view_flag);
+    fixed(1, reserved_one_bit, 1);
+
+    return 0;
+}
+
 static int FUNC(nal_unit_header)(CodedBitstreamContext *ctx, RWContext *rw,
                                  H264RawNALUnitHeader *current,
                                  uint32_t valid_type_mask)
@@ -60,8 +77,7 @@ static int FUNC(nal_unit_header)(CodedBitstreamContext *ctx, RWContext *rw,
             return AVERROR_PATCHWELCOME;
 
         } else {
-            av_log(ctx->log_ctx, AV_LOG_ERROR, "MVC not supported.\n");
-            return AVERROR_PATCHWELCOME;
+            CHECK(FUNC(nal_unit_header_mvc_extension)(ctx, rw, &current->mvc));
         }
     }
 
@@ -257,15 +273,10 @@ static int FUNC(vui_parameters_default)(CodedBitstreamContext *ctx,
     return 0;
 }
 
-static int FUNC(sps)(CodedBitstreamContext *ctx, RWContext *rw,
-                     H264RawSPS *current)
+static int FUNC(sps_data)(CodedBitstreamContext *ctx, RWContext *rw,
+                          H264RawSPS *current)
 {
     int err, i;
-
-    HEADER("Sequence Parameter Set");
-
-    CHECK(FUNC(nal_unit_header)(ctx, rw, &current->nal_unit_header,
-                                1 << H264_NAL_SPS));
 
     ub(8, profile_idc);
 
@@ -364,6 +375,118 @@ static int FUNC(sps)(CodedBitstreamContext *ctx, RWContext *rw,
     else
         CHECK(FUNC(vui_parameters_default)(ctx, rw, &current->vui, current));
 
+    return 0;
+}
+
+static int FUNC(sps)(CodedBitstreamContext *ctx, RWContext *rw,
+                     H264RawSPS *current)
+{
+    int err;
+
+    HEADER("Sequence Parameter Set");
+
+    CHECK(FUNC(nal_unit_header)(ctx, rw, &current->nal_unit_header,
+                                1 << H264_NAL_SPS));
+
+    CHECK(FUNC(sps_data)(ctx, rw, current));
+
+    CHECK(FUNC(rbsp_trailing_bits)(ctx, rw));
+
+    return 0;
+}
+
+static int FUNC(sps_mvc_extension)(CodedBitstreamContext *ctx, RWContext *rw,
+                                    H264RawSPSMVCExtension *current)
+{
+    int err, i, j;
+
+    ue(num_views_minus1, 0, H264_MVC_MAX_VIEWS - 1);
+
+    for (i = 0; i <= current->num_views_minus1; i++)
+        ues(view_id[i], 0, 1023, 1, i);
+
+    for (i = 1; i <= current->num_views_minus1; i++) {
+        ues(num_anchor_refs_l0[i], 0, H264_MAX_VIEW_REFS, 1, i);
+        for (j = 0; j < current->num_anchor_refs_l0[i]; j++)
+            ues(anchor_ref_l0[i][j], 0, 1023, 2, i, j);
+
+        ues(num_anchor_refs_l1[i], 0, H264_MAX_VIEW_REFS, 1, i);
+        for (j = 0; j < current->num_anchor_refs_l1[i]; j++)
+            ues(anchor_ref_l1[i][j], 0, 1023, 2, i, j);
+    }
+
+    for (i = 1; i <= current->num_views_minus1; i++) {
+        ues(num_non_anchor_refs_l0[i], 0, H264_MAX_VIEW_REFS, 1, i);
+        for (j = 0; j < current->num_non_anchor_refs_l0[i]; j++)
+            ues(non_anchor_ref_l0[i][j], 0, 1023, 2, i, j);
+
+        ues(num_non_anchor_refs_l1[i], 0, H264_MAX_VIEW_REFS, 1, i);
+        for (j = 0; j < current->num_non_anchor_refs_l1[i]; j++)
+            ues(non_anchor_ref_l1[i][j], 0, 1023, 2, i, j);
+    }
+
+    ue(num_level_values_signalled_minus1, 0, H264_MAX_LEVEL_VALUES - 1);
+
+    for (i = 0; i <= current->num_level_values_signalled_minus1; i++) {
+        H264RawSPSMVCLevelValue *level = &current->level_values[i];
+        H264RawSPSMVCLevelValue *current = level;
+
+        ubs(8, level_idc, 1, i);
+        ues(num_applicable_ops_minus1, 0, H264_MAX_APPLICABLE_OPS - 1, 1, i);
+
+        for (j = 0; j <= current->num_applicable_ops_minus1; j++) {
+            H264RawSPSMVCApplicableOp *op = &current->applicable_ops[j];
+            H264RawSPSMVCApplicableOp *current = op;
+            int k;
+
+            ubs(3, applicable_op_temporal_id, 2, i, j);
+            ues(applicable_op_num_target_views_minus1,
+                0, H264_MVC_MAX_VIEWS - 1, 2, i, j);
+            for (k = 0; k <= current->applicable_op_num_target_views_minus1; k++)
+                ues(applicable_op_target_view_id[k], 0, 1023, 3, i, j, k);
+            ues(applicable_op_num_views_minus1,
+                0, H264_MVC_MAX_VIEWS - 1, 2, i, j);
+        }
+    }
+
+    return 0;
+}
+
+static int FUNC(subset_sps)(CodedBitstreamContext *ctx, RWContext *rw,
+                             H264RawSubsetSPS *current)
+{
+    int err;
+
+    HEADER("Subset Sequence Parameter Set");
+
+    CHECK(FUNC(nal_unit_header)(ctx, rw, &current->nal_unit_header,
+                                1 << H264_NAL_SUB_SPS));
+
+    CHECK(FUNC(sps_data)(ctx, rw, &current->sps));
+
+    if (current->sps.profile_idc == 118 ||
+        current->sps.profile_idc == 128) {
+        fixed(1, bit_equal_to_one, 1);
+        CHECK(FUNC(sps_mvc_extension)(ctx, rw, &current->mvc));
+        flag(mvc_vui_parameters_present_flag);
+        if (current->mvc_vui_parameters_present_flag) {
+            // mvc_vui_parameters_extension() is not implemented.
+            // The core MVC extension data has been parsed; return
+            // without reading the remaining bits.
+            return 0;
+        }
+    } else if (current->sps.profile_idc ==  83 ||
+               current->sps.profile_idc ==  86) {
+        av_log(ctx->log_ctx, AV_LOG_ERROR, "SVC not supported.\n");
+        return AVERROR_PATCHWELCOME;
+    } else if (current->sps.profile_idc == 138 ||
+               current->sps.profile_idc == 135) {
+        av_log(ctx->log_ctx, AV_LOG_ERROR, "MVCD not supported.\n");
+        return AVERROR_PATCHWELCOME;
+    }
+
+    flag(additional_extension2_flag);
+
     CHECK(FUNC(rbsp_trailing_bits)(ctx, rw));
 
     return 0;
@@ -417,6 +540,8 @@ static int FUNC(pps)(CodedBitstreamContext *ctx, RWContext *rw,
     ue(seq_parameter_set_id, 0, 31);
 
     sps = h264->sps[current->seq_parameter_set_id];
+    if (!sps && h264->subset_sps[current->seq_parameter_set_id])
+        sps = &h264->subset_sps[current->seq_parameter_set_id]->sps;
     if (!sps) {
         av_log(ctx->log_ctx, AV_LOG_ERROR, "SPS id %d not available.\n",
                current->seq_parameter_set_id);
@@ -948,6 +1073,74 @@ static int FUNC(ref_pic_list_modification)(CodedBitstreamContext *ctx, RWContext
     return 0;
 }
 
+static int FUNC(ref_pic_list_mvc_modification)(CodedBitstreamContext *ctx,
+                                                RWContext *rw,
+                                                H264RawSliceHeader *current)
+{
+    CodedBitstreamH264Context *h264 = ctx->priv_data;
+    const H264RawSPS *sps = h264->active_sps;
+    int err, i, mopn;
+
+    if (current->slice_type % 5 != 2 &&
+        current->slice_type % 5 != 4) {
+        flag(ref_pic_list_modification_flag_l0);
+        if (current->ref_pic_list_modification_flag_l0) {
+            for (i = 0; i < H264_MAX_RPLM_COUNT; i++) {
+                xue(modification_of_pic_nums_idc,
+                    current->rplm_l0[i].modification_of_pic_nums_idc, 0, 5, 0);
+
+                mopn = current->rplm_l0[i].modification_of_pic_nums_idc;
+                if (mopn == 3)
+                    break;
+
+                if (mopn == 0 || mopn == 1)
+                    xue(abs_diff_pic_num_minus1,
+                        current->rplm_l0[i].abs_diff_pic_num_minus1,
+                        0, (1 + current->field_pic_flag) *
+                        (1 << (sps->log2_max_frame_num_minus4 + 4)), 0);
+                else if (mopn == 2)
+                    xue(long_term_pic_num,
+                        current->rplm_l0[i].long_term_pic_num,
+                        0, sps->max_num_ref_frames - 1, 0);
+                else if (mopn == 4 || mopn == 5)
+                    xue(abs_diff_view_idx_minus1,
+                        current->rplm_l0[i].abs_diff_view_idx_minus1,
+                        0, H264_MVC_MAX_VIEWS - 1, 0);
+            }
+        }
+    }
+
+    if (current->slice_type % 5 == 1) {
+        flag(ref_pic_list_modification_flag_l1);
+        if (current->ref_pic_list_modification_flag_l1) {
+            for (i = 0; i < H264_MAX_RPLM_COUNT; i++) {
+                xue(modification_of_pic_nums_idc,
+                    current->rplm_l1[i].modification_of_pic_nums_idc, 0, 5, 0);
+
+                mopn = current->rplm_l1[i].modification_of_pic_nums_idc;
+                if (mopn == 3)
+                    break;
+
+                if (mopn == 0 || mopn == 1)
+                    xue(abs_diff_pic_num_minus1,
+                        current->rplm_l1[i].abs_diff_pic_num_minus1,
+                        0, (1 + current->field_pic_flag) *
+                        (1 << (sps->log2_max_frame_num_minus4 + 4)), 0);
+                else if (mopn == 2)
+                    xue(long_term_pic_num,
+                        current->rplm_l1[i].long_term_pic_num,
+                        0, sps->max_num_ref_frames - 1, 0);
+                else if (mopn == 4 || mopn == 5)
+                    xue(abs_diff_view_idx_minus1,
+                        current->rplm_l1[i].abs_diff_view_idx_minus1,
+                        0, H264_MVC_MAX_VIEWS - 1, 0);
+            }
+        }
+    }
+
+    return 0;
+}
+
 static int FUNC(pred_weight_table)(CodedBitstreamContext *ctx, RWContext *rw,
                                    H264RawSliceHeader *current)
 {
@@ -1066,9 +1259,10 @@ static int FUNC(slice_header)(CodedBitstreamContext *ctx, RWContext *rw,
     HEADER("Slice Header");
 
     CHECK(FUNC(nal_unit_header)(ctx, rw, &current->nal_unit_header,
-                                1 << H264_NAL_SLICE     |
-                                1 << H264_NAL_IDR_SLICE |
-                                1 << H264_NAL_AUXILIARY_SLICE));
+                                1 << H264_NAL_SLICE       |
+                                1 << H264_NAL_IDR_SLICE   |
+                                1 << H264_NAL_AUXILIARY_SLICE |
+                                1 << H264_NAL_EXTEN_SLICE));
 
     if (current->nal_unit_header.nal_unit_type == H264_NAL_AUXILIARY_SLICE) {
         if (!h264->last_slice_nal_unit_type) {
@@ -1078,6 +1272,8 @@ static int FUNC(slice_header)(CodedBitstreamContext *ctx, RWContext *rw,
             return AVERROR_INVALIDDATA;
         }
         idr_pic_flag = h264->last_slice_nal_unit_type == H264_NAL_IDR_SLICE;
+    } else if (current->nal_unit_header.nal_unit_type == H264_NAL_EXTEN_SLICE) {
+        idr_pic_flag = !current->nal_unit_header.mvc.non_idr_flag;
     } else {
         idr_pic_flag = current->nal_unit_header.nal_unit_type == H264_NAL_IDR_SLICE;
     }
@@ -1091,7 +1287,11 @@ static int FUNC(slice_header)(CodedBitstreamContext *ctx, RWContext *rw,
     slice_type_si = current->slice_type % 5 == 4;
     slice_type_sp = current->slice_type % 5 == 3;
 
-    if (idr_pic_flag && !(slice_type_i || slice_type_si)) {
+    // In MVC (Annex H), a dependent view IDR picture may use P/B
+    // slices for inter-view prediction, so this constraint only
+    // applies to non-extension slices.
+    if (idr_pic_flag && !(slice_type_i || slice_type_si) &&
+        current->nal_unit_header.nal_unit_type != H264_NAL_EXTEN_SLICE) {
         av_log(ctx->log_ctx, AV_LOG_ERROR, "Invalid slice type %d "
                "for IDR picture.\n", current->slice_type);
         return AVERROR_INVALIDDATA;
@@ -1108,6 +1308,8 @@ static int FUNC(slice_header)(CodedBitstreamContext *ctx, RWContext *rw,
     h264->active_pps = pps;
 
     sps = h264->sps[pps->seq_parameter_set_id];
+    if (!sps && h264->subset_sps[pps->seq_parameter_set_id])
+        sps = &h264->subset_sps[pps->seq_parameter_set_id]->sps;
     if (!sps) {
         av_log(ctx->log_ctx, AV_LOG_ERROR, "SPS id %d not available.\n",
                pps->seq_parameter_set_id);
@@ -1181,10 +1383,9 @@ static int FUNC(slice_header)(CodedBitstreamContext *ctx, RWContext *rw,
         }
     }
 
-    if (current->nal_unit_header.nal_unit_type == 20 ||
-        current->nal_unit_header.nal_unit_type == 21) {
-        av_log(ctx->log_ctx, AV_LOG_ERROR, "MVC / 3DAVC not supported.\n");
-        return AVERROR_PATCHWELCOME;
+    if (current->nal_unit_header.nal_unit_type == H264_NAL_EXTEN_SLICE ||
+        current->nal_unit_header.nal_unit_type == H264_NAL_DEPTH_EXTEN_SLICE) {
+        CHECK(FUNC(ref_pic_list_mvc_modification)(ctx, rw, current));
     } else {
         CHECK(FUNC(ref_pic_list_modification)(ctx, rw, current));
     }
@@ -1270,6 +1471,25 @@ static int FUNC(filler)(CodedBitstreamContext *ctx, RWContext *rw,
             fixed(8, ff_byte, 0xff);
     }
 #endif
+
+    CHECK(FUNC(rbsp_trailing_bits)(ctx, rw));
+
+    return 0;
+}
+
+static int FUNC(prefix_nal_unit)(CodedBitstreamContext *ctx, RWContext *rw,
+                                 H264RawPrefixNALUnit *current)
+{
+    int err;
+
+    HEADER("Prefix NAL Unit");
+
+    CHECK(FUNC(nal_unit_header)(ctx, rw, &current->nal_unit_header,
+                                1 << H264_NAL_PREFIX));
+
+    /* For MVC (svc_extension_flag == 0): the prefix NAL unit body is
+     * empty; the MVC extension header has already been parsed as part
+     * of the NAL unit header. SVC prefix NAL units are not supported. */
 
     CHECK(FUNC(rbsp_trailing_bits)(ctx, rw));
 
