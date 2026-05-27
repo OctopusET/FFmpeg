@@ -61,14 +61,14 @@ static int get_scale_factor(const H264SliceContext *sl,
 void ff_h264_direct_dist_scale_factor(const H264Context *const h,
                                       H264SliceContext *sl)
 {
-    const int poc  = FIELD_PICTURE(h) ? h->cur_pic_ptr->field_poc[h->picture_structure == PICT_BOTTOM_FIELD]
-                                      : h->cur_pic_ptr->poc;
+    const int poc  = FIELD_PICTURE(h) ? h->view->cur_pic_ptr->field_poc[h->view->picture_structure == PICT_BOTTOM_FIELD]
+                                      : h->view->cur_pic_ptr->poc;
     const int poc1 = sl->ref_list[1][0].poc;
     int i, field;
 
     if (FRAME_MBAFF(h))
         for (field = 0; field < 2; field++) {
-            const int poc  = h->cur_pic_ptr->field_poc[field];
+            const int poc  = h->view->cur_pic_ptr->field_poc[field];
             const int poc1 = sl->ref_list[1][0].parent->field_poc[field];
             for (i = 0; i < 2 * sl->ref_count[0]; i++)
                 sl->dist_scale_factor_field[field][i ^ field] =
@@ -87,7 +87,7 @@ static void fill_colmap(const H264Context *h, H264SliceContext *sl,
     int j, old_ref, rfield;
     int start  = mbafi ? 16                       : 0;
     int end    = mbafi ? 16 + 2 * sl->ref_count[0] : sl->ref_count[0];
-    int interl = mbafi || h->picture_structure != PICT_FRAME;
+    int interl = mbafi || h->view->picture_structure != PICT_FRAME;
 
     /* bogus; fills in for missing frames */
     memset(map[list], 0, sizeof(map[list]));
@@ -120,9 +120,9 @@ static void fill_colmap(const H264Context *h, H264SliceContext *sl,
 void ff_h264_direct_ref_list_init(const H264Context *const h, H264SliceContext *sl)
 {
     H264Ref *const ref1 = &sl->ref_list[1][0];
-    H264Picture *const cur = h->cur_pic_ptr;
+    H264Picture *const cur = h->view->cur_pic_ptr;
     int list, field;
-    int sidx     = (h->picture_structure & 1) ^ 1;
+    int sidx     = (h->view->picture_structure & 1) ^ 1;
     int ref1sidx = (ref1->reference      & 1) ^ 1;
 
     /* Updates to cur_pic are not safe once ff_thread_finish_setup() has been
@@ -135,12 +135,12 @@ void ff_h264_direct_ref_list_init(const H264Context *const h, H264SliceContext *
                                                  (sl->ref_list[list][j].reference & 3);
         }
 
-        if (h->picture_structure == PICT_FRAME) {
+        if (h->view->picture_structure == PICT_FRAME) {
             memcpy(cur->ref_count[1], cur->ref_count[0], sizeof(cur->ref_count[0]));
             memcpy(cur->ref_poc[1],   cur->ref_poc[0],   sizeof(cur->ref_poc[0]));
         }
 
-        if (h->current_slice == 0) {
+        if (h->view->current_slice == 0) {
             cur->mbaff = FRAME_MBAFF(h);
         } else {
             av_assert0(cur->mbaff == FRAME_MBAFF(h));
@@ -152,8 +152,8 @@ void ff_h264_direct_ref_list_init(const H264Context *const h, H264SliceContext *
     if (sl->list_count != 2 || !sl->ref_count[1])
         return;
 
-    if (h->picture_structure == PICT_FRAME) {
-        int cur_poc  = h->cur_pic_ptr->poc;
+    if (h->view->picture_structure == PICT_FRAME) {
+        int cur_poc  = h->view->cur_pic_ptr->poc;
         const int *col_poc = sl->ref_list[1][0].parent->field_poc;
         if (col_poc[0] == INT_MAX && col_poc[1] == INT_MAX) {
             av_log(h->avctx, AV_LOG_ERROR, "co located POCs unavailable\n");
@@ -164,7 +164,7 @@ void ff_h264_direct_ref_list_init(const H264Context *const h, H264SliceContext *
         ref1sidx =
         sidx     = sl->col_parity;
     // FL -> FL & differ parity
-    } else if (!(h->picture_structure & sl->ref_list[1][0].reference) &&
+    } else if (!(h->view->picture_structure & sl->ref_list[1][0].reference) &&
                !sl->ref_list[1][0].parent->mbaff) {
         sl->col_fieldoff = 2 * sl->ref_list[1][0].reference - 3;
     }

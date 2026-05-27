@@ -62,11 +62,11 @@ static int nvdec_h264_start_frame(AVCodecContext *avctx,
 
     int i, dpb_size, ret;
 
-    ret = ff_nvdec_start_frame(avctx, h->cur_pic_ptr->f);
+    ret = ff_nvdec_start_frame(avctx, h->view->cur_pic_ptr->f);
     if (ret < 0)
         return ret;
 
-    fdd = h->cur_pic_ptr->f->private_ref;
+    fdd = h->view->cur_pic_ptr->f->private_ref;
     cf  = (NVDECFrame*)fdd->hwaccel_priv;
 
     *pp = (CUVIDPICPARAMS) {
@@ -74,9 +74,9 @@ static int nvdec_h264_start_frame(AVCodecContext *avctx,
         .FrameHeightInMbs  = h->mb_height,
         .CurrPicIdx        = cf->idx,
         .field_pic_flag    = FIELD_PICTURE(h),
-        .bottom_field_flag = h->picture_structure == PICT_BOTTOM_FIELD,
-        .second_field      = FIELD_PICTURE(h) && !h->first_field,
-        .ref_pic_flag      = h->nal_ref_idc != 0,
+        .bottom_field_flag = h->view->picture_structure == PICT_BOTTOM_FIELD,
+        .second_field      = FIELD_PICTURE(h) && !h->view->first_field,
+        .ref_pic_flag      = h->view->nal_ref_idc != 0,
         .intra_pic_flag    = 1,
 
         .CodecSpecific.h264 = {
@@ -106,10 +106,10 @@ static int nvdec_h264_start_frame(AVCodecContext *avctx,
             .constrained_intra_pred_flag            = pps->constrained_intra_pred,
             .chroma_qp_index_offset                 = pps->chroma_qp_index_offset[0],
             .second_chroma_qp_index_offset          = pps->chroma_qp_index_offset[1],
-            .ref_pic_flag                           = h->nal_ref_idc != 0,
+            .ref_pic_flag                           = h->view->nal_ref_idc != 0,
             .frame_num                              = h->poc.frame_num,
-            .CurrFieldOrderCnt[0]                   = h->cur_pic_ptr->field_poc[0],
-            .CurrFieldOrderCnt[1]                   = h->cur_pic_ptr->field_poc[1],
+            .CurrFieldOrderCnt[0]                   = h->view->cur_pic_ptr->field_poc[0],
+            .CurrFieldOrderCnt[1]                   = h->view->cur_pic_ptr->field_poc[1],
         },
     };
 
@@ -118,11 +118,11 @@ static int nvdec_h264_start_frame(AVCodecContext *avctx,
     memcpy(ppc->WeightScale8x8[1], pps->scaling_matrix8[3], sizeof(ppc->WeightScale8x8[0]));
 
     dpb_size = 0;
-    for (i = 0; i < h->short_ref_count; i++)
-        dpb_add(h, &ppc->dpb[dpb_size++], h->short_ref[i], h->short_ref[i]->frame_num);
+    for (i = 0; i < h->view->short_ref_count; i++)
+        dpb_add(h, &ppc->dpb[dpb_size++], h->view->short_ref[i], h->view->short_ref[i]->frame_num);
     for (i = 0; i < 16; i++) {
-        if (h->long_ref[i])
-            dpb_add(h, &ppc->dpb[dpb_size++], h->long_ref[i], i);
+        if (h->view->long_ref[i])
+            dpb_add(h, &ppc->dpb[dpb_size++], h->view->long_ref[i], i);
     }
 
     for (i = dpb_size; i < FF_ARRAY_ELEMS(ppc->dpb); i++)

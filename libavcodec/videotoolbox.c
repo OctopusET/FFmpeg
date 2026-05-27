@@ -1088,7 +1088,7 @@ int ff_videotoolbox_common_end_frame(AVCodecContext *avctx, AVFrame *frame)
 static int videotoolbox_h264_end_frame(AVCodecContext *avctx)
 {
     H264Context *h = avctx->priv_data;
-    AVFrame *frame = h->cur_pic_ptr->f;
+    AVFrame *frame = h->view->cur_pic_ptr->f;
     VTContext *vtctx = avctx->internal->hwaccel_priv_data;
     int ret = ff_videotoolbox_common_end_frame(avctx, frame);
     vtctx->bitstream_size = 0;

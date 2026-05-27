@@ -55,7 +55,7 @@ static int d3d12va_h264_start_frame(AVCodecContext *avctx,
                                     av_unused uint32_t size)
 {
     const H264Context        *h       = avctx->priv_data;
-    H264DecodePictureContext *ctx_pic = h->cur_pic_ptr->hwaccel_picture_private;
+    H264DecodePictureContext *ctx_pic = h->view->cur_pic_ptr->hwaccel_picture_private;
     D3D12VADecodeContext     *ctx     = D3D12VA_DECODE_CONTEXT(avctx);
 
     if (!ctx)
@@ -81,7 +81,7 @@ static int d3d12va_h264_decode_slice(AVCodecContext *avctx, const uint8_t *buffe
     unsigned position;
     const H264Context        *h               = avctx->priv_data;
     const H264SliceContext   *sl              = &h->slice_ctx[0];
-    const H264Picture        *current_picture = h->cur_pic_ptr;
+    const H264Picture        *current_picture = h->view->cur_pic_ptr;
     H264DecodePictureContext *ctx_pic         = current_picture->hwaccel_picture_private;
 
     if (ctx_pic->slice_count >= MAX_SLICES)
@@ -107,7 +107,7 @@ static int update_input_arguments(AVCodecContext *avctx, D3D12_VIDEO_DECODE_INPU
 {
     D3D12VADecodeContext     *ctx             = D3D12VA_DECODE_CONTEXT(avctx);
     const H264Context        *h               = avctx->priv_data;
-    const H264Picture        *current_picture = h->cur_pic_ptr;
+    const H264Picture        *current_picture = h->view->cur_pic_ptr;
     H264DecodePictureContext *ctx_pic         = current_picture->hwaccel_picture_private;
 
     int i;
@@ -166,7 +166,7 @@ static int update_input_arguments(AVCodecContext *avctx, D3D12_VIDEO_DECODE_INPU
 static int d3d12va_h264_end_frame(AVCodecContext *avctx)
 {
     H264Context               *h       = avctx->priv_data;
-    H264DecodePictureContext  *ctx_pic = h->cur_pic_ptr->hwaccel_picture_private;
+    H264DecodePictureContext  *ctx_pic = h->view->cur_pic_ptr->hwaccel_picture_private;
     H264SliceContext          *sl      = &h->slice_ctx[0];
 
     int ret;
@@ -174,7 +174,7 @@ static int d3d12va_h264_end_frame(AVCodecContext *avctx)
     if (ctx_pic->slice_count <= 0 || ctx_pic->bitstream_size <= 0)
         return -1;
 
-    ret = ff_d3d12va_common_end_frame(avctx, h->cur_pic_ptr->f,
+    ret = ff_d3d12va_common_end_frame(avctx, h->view->cur_pic_ptr->f,
                                       &ctx_pic->pp, sizeof(ctx_pic->pp),
                                       &ctx_pic->qm, sizeof(ctx_pic->qm),
                                       update_input_arguments);

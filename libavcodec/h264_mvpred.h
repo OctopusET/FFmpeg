@@ -97,7 +97,7 @@ static av_always_inline void write_back_motion_list(const H264Context *h,
                                                     int b_xy, int b8_xy,
                                                     int mb_type, int list)
 {
-    int16_t(*mv_dst)[2] = &h->cur_pic.motion_val[list][b_xy];
+    int16_t(*mv_dst)[2] = &h->view->cur_pic.motion_val[list][b_xy];
     int16_t(*mv_src)[2] = &sl->mv_cache[list][scan8[0]];
     AV_COPY128(mv_dst + 0 * b_stride, mv_src + 8 * 0);
     AV_COPY128(mv_dst + 1 * b_stride, mv_src + 8 * 1);
@@ -118,7 +118,7 @@ static av_always_inline void write_back_motion_list(const H264Context *h,
     }
 
     {
-        int8_t *ref_index = &h->cur_pic.ref_index[list][b8_xy];
+        int8_t *ref_index = &h->view->cur_pic.ref_index[list][b8_xy];
         int8_t *ref_cache = sl->ref_cache[list];
         ref_index[0 + 0 * 2] = ref_cache[scan8[0]];
         ref_index[1 + 0 * 2] = ref_cache[scan8[4]];
@@ -138,7 +138,7 @@ static av_always_inline void write_back_motion(const H264Context *h,
     if (USES_LIST(mb_type, 0)) {
         write_back_motion_list(h, sl, b_stride, b_xy, b8_xy, mb_type, 0);
     } else {
-        fill_rectangle(&h->cur_pic.ref_index[0][b8_xy],
+        fill_rectangle(&h->view->cur_pic.ref_index[0][b8_xy],
                        2, 2, 2, (uint8_t)LIST_NOT_USED, 1);
     }
     if (USES_LIST(mb_type, 1))
@@ -180,15 +180,15 @@ static av_always_inline int fetch_diagonal_mv(const H264Context *h, H264SliceCon
         const int mb_type = mb_types[xy + (y4 >> 2) * h->mb_stride];    \
         if (!USES_LIST(mb_type, list))                                  \
             return LIST_NOT_USED;                                       \
-        mv = h->cur_pic_ptr->motion_val[list][h->mb2b_xy[xy] + 3 + y4 * h->b_stride]; \
+        mv = h->view->cur_pic_ptr->motion_val[list][h->mb2b_xy[xy] + 3 + y4 * h->b_stride]; \
         sl->mv_cache[list][scan8[0] - 2][0] = mv[0];                     \
         sl->mv_cache[list][scan8[0] - 2][1] = mv[1] MV_OP;               \
-        return h->cur_pic_ptr->ref_index[list][4 * xy + 1 + (y4 & ~1)] REF_OP;
+        return h->view->cur_pic_ptr->ref_index[list][4 * xy + 1 + (y4 & ~1)] REF_OP;
 
         if (topright_ref == PART_NOT_AVAILABLE
             && i >= scan8[0] + 8 && (i & 7) == 4
             && sl->ref_cache[list][scan8[0] - 1] != PART_NOT_AVAILABLE) {
-            const uint32_t *mb_types = h->cur_pic_ptr->mb_type;
+            const uint32_t *mb_types = h->view->cur_pic_ptr->mb_type;
             const int16_t *mv;
             AV_ZERO32(sl->mv_cache[list][scan8[0] - 2]);
             *C = sl->mv_cache[list][scan8[0] - 2];
@@ -390,8 +390,8 @@ static av_always_inline void pred_pskip_motion(const H264Context *const h,
 {
     DECLARE_ALIGNED(4, static const int16_t, zeromv)[2] = { 0 };
     DECLARE_ALIGNED(4, int16_t, mvbuf)[3][2];
-    int8_t *ref     = h->cur_pic.ref_index[0];
-    int16_t(*mv)[2] = h->cur_pic.motion_val[0];
+    int8_t *ref     = h->view->cur_pic.ref_index[0];
+    int16_t(*mv)[2] = h->view->cur_pic.motion_val[0];
     int top_ref, left_ref, diagonal_ref, match_count, mx, my;
     const int16_t *A, *B, *C;
     int b_stride = h->b_stride;
@@ -507,7 +507,7 @@ static void fill_decode_neighbors(const H264Context *h, H264SliceContext *sl, in
     left_xy[LBOT] = left_xy[LTOP] = mb_xy - 1;
     sl->left_block = left_block_options[0];
     if (FRAME_MBAFF(h)) {
-        const int left_mb_field_flag = IS_INTERLACED(h->cur_pic.mb_type[mb_xy - 1]);
+        const int left_mb_field_flag = IS_INTERLACED(h->view->cur_pic.mb_type[mb_xy - 1]);
         const int curr_mb_field_flag = IS_INTERLACED(mb_type);
         if (sl->mb_y & 1) {
             if (left_mb_field_flag != curr_mb_field_flag) {
@@ -525,9 +525,9 @@ static void fill_decode_neighbors(const H264Context *h, H264SliceContext *sl, in
             }
         } else {
             if (curr_mb_field_flag) {
-                topleft_xy  += h->mb_stride & (((h->cur_pic.mb_type[top_xy - 1] >> 7) & 1) - 1);
-                topright_xy += h->mb_stride & (((h->cur_pic.mb_type[top_xy + 1] >> 7) & 1) - 1);
-                top_xy      += h->mb_stride & (((h->cur_pic.mb_type[top_xy]     >> 7) & 1) - 1);
+                topleft_xy  += h->mb_stride & (((h->view->cur_pic.mb_type[top_xy - 1] >> 7) & 1) - 1);
+                topright_xy += h->mb_stride & (((h->view->cur_pic.mb_type[top_xy + 1] >> 7) & 1) - 1);
+                top_xy      += h->mb_stride & (((h->view->cur_pic.mb_type[top_xy]     >> 7) & 1) - 1);
             }
             if (left_mb_field_flag != curr_mb_field_flag) {
                 if (curr_mb_field_flag) {
@@ -547,11 +547,11 @@ static void fill_decode_neighbors(const H264Context *h, H264SliceContext *sl, in
     sl->left_mb_xy[LBOT] = left_xy[LBOT];
     //FIXME do we need all in the context?
 
-    sl->topleft_type    = h->cur_pic.mb_type[topleft_xy];
-    sl->top_type        = h->cur_pic.mb_type[top_xy];
-    sl->topright_type   = h->cur_pic.mb_type[topright_xy];
-    sl->left_type[LTOP] = h->cur_pic.mb_type[left_xy[LTOP]];
-    sl->left_type[LBOT] = h->cur_pic.mb_type[left_xy[LBOT]];
+    sl->topleft_type    = h->view->cur_pic.mb_type[topleft_xy];
+    sl->top_type        = h->view->cur_pic.mb_type[top_xy];
+    sl->topright_type   = h->view->cur_pic.mb_type[topright_xy];
+    sl->left_type[LTOP] = h->view->cur_pic.mb_type[left_xy[LTOP]];
+    sl->left_type[LBOT] = h->view->cur_pic.mb_type[left_xy[LBOT]];
 
     if (FMO) {
         if (h->slice_table[topleft_xy] != sl->slice_num)
@@ -617,7 +617,7 @@ static void fill_decode_caches(const H264Context *h, H264SliceContext *sl, int m
                         sl->left_samples_available    &= 0xFF5F;
                     }
                 } else {
-                    int left_typei = h->cur_pic.mb_type[left_xy[LTOP] + h->mb_stride];
+                    int left_typei = h->view->cur_pic.mb_type[left_xy[LTOP] + h->mb_stride];
 
                     av_assert2(left_xy[LTOP] == left_xy[LBOT]);
                     if (!((left_typei & type_mask) && (left_type[LTOP] & type_mask))) {
@@ -739,9 +739,9 @@ static void fill_decode_caches(const H264Context *h, H264SliceContext *sl, int m
         int b_stride = h->b_stride;
         for (list = 0; list < sl->list_count; list++) {
             int8_t *ref_cache = &sl->ref_cache[list][scan8[0]];
-            int8_t *ref       = h->cur_pic.ref_index[list];
+            int8_t *ref       = h->view->cur_pic.ref_index[list];
             int16_t(*mv_cache)[2] = &sl->mv_cache[list][scan8[0]];
-            int16_t(*mv)[2]       = h->cur_pic.motion_val[list];
+            int16_t(*mv)[2]       = h->view->cur_pic.motion_val[list];
             if (!USES_LIST(mb_type, list))
                 continue;
             av_assert2(!(IS_DIRECT(mb_type) && !sl->direct_spatial_mv_pred));
@@ -958,8 +958,8 @@ av_unused static void decode_mb_skip(const H264Context *h, H264SliceContext *sl)
     }
 
     write_back_motion(h, sl, mb_type);
-    h->cur_pic.mb_type[mb_xy]      = mb_type;
-    h->cur_pic.qscale_table[mb_xy] = sl->qscale;
+    h->view->cur_pic.mb_type[mb_xy]      = mb_type;
+    h->view->cur_pic.qscale_table[mb_xy] = sl->qscale;
     h->slice_table[mb_xy]          = sl->slice_num;
     sl->prev_mb_skipped            = 1;
 }
