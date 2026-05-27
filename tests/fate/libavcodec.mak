@@ -71,6 +71,11 @@ fate-dct8x8: libavcodec/tests/dct$(EXESUF)
 fate-dct8x8: CMD = run libavcodec/tests/dct$(EXESUF)
 fate-dct8x8: CMP = null
 
+FATE_LIBAVCODEC-$(CONFIG_CBS_H264) += fate-h264-mvc-cbs
+fate-h264-mvc-cbs: libavcodec/tests/h264_mvc_cbs$(EXESUF)
+fate-h264-mvc-cbs: CMD = run libavcodec/tests/h264_mvc_cbs$(EXESUF)
+fate-h264-mvc-cbs: CMP = null
+
 FATE_LIBAVCODEC-$(CONFIG_H264_METADATA_BSF) += fate-h264-levels
 fate-h264-levels: libavcodec/tests/h264_levels$(EXESUF)
 fate-h264-levels: CMD = run libavcodec/tests/h264_levels$(EXESUF)
