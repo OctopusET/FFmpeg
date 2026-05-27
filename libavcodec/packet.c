@@ -312,6 +312,7 @@ const char *av_packet_side_data_name(enum AVPacketSideDataType type)
     case AV_PKT_DATA_RTCP_SR:                    return "RTCP Sender Report";
     case AV_PKT_DATA_EXIF:                       return "EXIF metadata";
     case AV_PKT_DATA_HEVC_CONF:                  return "HEVC enhancement-layer decoder configuration";
+    case AV_PKT_DATA_H264_MVC_DEP:               return "H.264 MVC dependent view";
     }
     return NULL;
 }

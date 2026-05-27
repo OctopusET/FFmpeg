@@ -384,6 +384,17 @@ enum AVPacketSideDataType {
     AV_PKT_DATA_HEVC_CONF,
 
     /**
+     * H.264 MVC (Annex H) dependent-view data belonging to the same
+     * access unit as the packet it is attached to.  The payload is a
+     * sequence of Annex B start-code-prefixed NAL units of the dependent
+     * view (subset SPS, PPS, prefix NAL, SEI and coded slice extension,
+     * i.e. NAL unit types 15, 8, 14, 6 and 20).  Attached by demuxers to
+     * the base-view packet and consumed by the H.264 decoder to decode
+     * the dependent view.
+     */
+    AV_PKT_DATA_H264_MVC_DEP,
+
+    /**
      * The number of side data types.
      * This is not part of the public API/ABI in the sense that it may
      * change when new side data types are added.
