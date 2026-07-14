@@ -1,0 +1,92 @@
+name: Build FFmpeg MVC
+on:
+  workflow_dispatch:
+  push:
+    branches: [mvc-macos-ci]
+
+jobs:
+  macos-arm64:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install x264 nasm pkg-config
+      - name: Configure and build
+        run: |
+          ./configure --enable-gpl --enable-libx264 \
+            --enable-static --disable-shared \
+            --pkg-config-flags="--static" \
+            --extra-cflags="-mmacosx-version-min=11.0" \
+            --extra-ldflags="-mmacosx-version-min=11.0"
+          make -j$(sysctl -n hw.ncpu)
+      - run: ./ffmpeg -version
+      - run: otool -L ffmpeg
+      - name: Package
+        run: tar czf ffmpeg-mvc-macos-arm64.tar.gz ffmpeg ffprobe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-macos-arm64
+          path: ffmpeg-mvc-macos-arm64.tar.gz
+
+  macos-x86_64:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install x264 nasm pkg-config
+      - name: Configure and build
+        run: |
+          ./configure --enable-gpl --enable-libx264 \
+            --enable-static --disable-shared \
+            --pkg-config-flags="--static" \
+            --extra-cflags="-mmacosx-version-min=11.0" \
+            --extra-ldflags="-mmacosx-version-min=11.0"
+          make -j$(sysctl -n hw.ncpu)
+      - run: ./ffmpeg -version
+      - run: otool -L ffmpeg
+      - name: Package
+        run: tar czf ffmpeg-mvc-macos-x86_64.tar.gz ffmpeg ffprobe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-macos-x86_64
+          path: ffmpeg-mvc-macos-x86_64.tar.gz
+
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y nasm libx264-dev pkg-config
+      - name: Configure and build
+        run: |
+          ./configure --enable-gpl --enable-libx264 \
+            --enable-static --disable-shared \
+            --pkg-config-flags="--static" \
+            --extra-ldflags="-static" \
+            --extra-libs="-lpthread -lm -ldl"
+          make -j$(nproc)
+      - run: ./ffmpeg -version
+      - run: file ffmpeg && ldd ffmpeg || echo "statically linked"
+      - name: Package
+        run: tar czf ffmpeg-mvc-linux-x86_64.tar.gz ffmpeg ffprobe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-linux-x86_64
+          path: ffmpeg-mvc-linux-x86_64.tar.gz
+
+  release:
+    needs: [macos-arm64, macos-x86_64, linux-x86_64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="mvc-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "FFmpeg MVC Build $tag" \
+            --notes "FFmpeg with H.264 MVC (Multiview Video Coding) decoder for Blu-ray 3D + MP4" \
+            ffmpeg-macos-arm64/ffmpeg-mvc-macos-arm64.tar.gz \
+            ffmpeg-macos-x86_64/ffmpeg-mvc-macos-x86_64.tar.gz \
+            ffmpeg-linux-x86_64/ffmpeg-mvc-linux-x86_64.tar.gz
